@@ -47,7 +47,14 @@ class OccupancyGridMap:
     self.recenter_to = self.module_positions[1]
     self.modules = range(1, n+1)
     self.edges = self.calculate_edges(self.modules, self.module_positions)
-    self.rotation_matrices()
+    try:
+      self.rotation_matrices()
+    except:
+      print(self.module_positions)
+      print(self.final_module_positions)
+      print(n)
+      self.rotation_matrices()
+
     self.init_actions()
 
   def calculate_grid_size(self, n):

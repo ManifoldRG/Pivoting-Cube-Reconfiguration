@@ -33,7 +33,7 @@ class OGMEnv:
             done = True
 
         observation = self.get_observation()
-        info = {'step': self.steps}
+        info = {'step': self.steps_taken}
         return observation, reward, done, info
     
     def get_observation(self):

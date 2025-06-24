@@ -47,8 +47,8 @@ def make_connected_positions(n, grid_size):
 
 def random_configuration(n):
     # Can change grid size matching with ogm, but recentering might cause problem, so made n + 3 instead of 2n+3
-    grid_size = max(5,  n + 5)
+    grid_size = max(5,  n + 3)
 
     init = make_connected_positions(n, grid_size)
     final = make_connected_positions(n, grid_size)
-    return init, final, grid_size
+    return init, final, max(5, 2*n+3)

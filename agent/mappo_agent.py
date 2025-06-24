@@ -9,6 +9,7 @@ from agent.base_agent import Agent
 class Actor(nn.Module):
     def __init__(self, input_dim, action_dim, hidden_dim=128):
         super().__init__()
+        print(input_dim, hidden_dim, action_dim)
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
@@ -153,64 +154,3 @@ class MAPPOAgent(Agent):
                 self.optimizer.step()
 
         self.buffer.clear()
-    
-    
-
-
-
-
-
-    def policy(self, obs):
-        obs_t = torch.tensor(obs, dtype=torch.float32)
-        logits, value = self.model(obs_t)
-        dist = torch.distribution.Categorical(logits=logits)
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
-        return action.numpy(), log_prob, value
-    
-    def update(self, trajectory):
-        obs = torch.tensor(np.array([t[0] for t in trajectory]), dtype=torch.float32)
-        actions = torch.tensor(np.array([t[1] for t in trajectory]), dtype=torch.int64)
-        old_logp = torch.stack([t[2] for t in trajectory])
-        rewards = [t[3] for t in trajectory]
-        values = torch.stack([t[4] for t in trajectory])
-
-        returns = []
-        G = 0.0
-        for r in reversed(rewards):
-            G = r + self.gamma * G
-            returns.insert(0, G)
-
-        returns = torch.tensor(returns, dtype=torch.float32)
-        advantages = returns - values.detach()
-
-        logits, value_pred = self.model(obs)
-        dist = torch.distributions.Categorical(logits=logits)
-        logp = dist.log_prob(actions)
-        ratio = (logp - old_logp).exp()
-        surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages
-        policy_loss = -torch.min(surr1, surr2).mean()
-        value_loss = nn.functional.mse_loss(value_pred, returns)
-        loss = policy_loss + 0.5 * value_loss
-
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-
-    def train_episodes(self, env):
-        obs = env.get_observation()
-        done = False
-        trajectory = []
-        ep_reward = 0.0
-        while not done:
-            action, logp, value = self.policy(obs)
-            next_obs, reward, done, _ = env.step(action)
-            for i in range(self.num_agents):
-                trajectory.append((obs[i], action[i], logp[i], reward[i], value[i]))
-
-            obs = next_obs
-            ep_reward += float(reward.mean())
-
-        self.update(trajectory)
-        return float(ep_reward)
