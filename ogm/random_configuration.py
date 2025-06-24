@@ -3,7 +3,7 @@ import numpy as np
 ## Model it as a 3D graph with 1 connected component
 ## So pick a random node and then pick random direction to make the modules
 
-def make_connected_positions(n, grid_size):
+def make_connected_positions(n, grid_size, starter = None):
     directions = [
         np.array([1, 0, 0]), 
         np.array([-1, 0, 0]),
@@ -17,7 +17,12 @@ def make_connected_positions(n, grid_size):
     used = set()
 
     root = tuple(np.random.randint(0, grid_size, size=3))
+    if starter is not None:
+        root = starter
+
     positions[1] = root
+
+
     used.add(root)
 
     for i in range(2, n+1):
@@ -25,6 +30,8 @@ def make_connected_positions(n, grid_size):
             found = False
             parent_id = np.random.choice(list(positions.keys()))
             parent_pos = np.array(positions[parent_id])
+
+
 
             np.random.shuffle(directions)
             for dir in directions:
@@ -37,9 +44,9 @@ def make_connected_positions(n, grid_size):
             if found:
                 break
 
-    # print(n)
-    # print(positions)
-    # print("----")
+    print(n)
+    print(positions)
+    print("----")
     return positions
 
     # Start root at 
@@ -50,5 +57,5 @@ def random_configuration(n):
     grid_size = max(5,  n + 3)
 
     init = make_connected_positions(n, grid_size)
-    final = make_connected_positions(n, grid_size)
+    final = make_connected_positions(n, grid_size, init[np.random.choice(list(init.keys()))])
     return init, final, max(5, 2*n+3)

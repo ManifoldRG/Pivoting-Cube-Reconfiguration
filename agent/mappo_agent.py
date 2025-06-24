@@ -93,8 +93,8 @@ class MAPPOAgent(Agent):
     def _compute_returns_adv(self):
         rewards = self.buffer.rewards
         dones = self.buffer.dones
-        states = torch.tensor(np.array(self.buffer.states), dtypes=torch.float32)
-        agent_ids = torch.tensor(np.array(self.buffer.agent_ids), dtypes=torch.long)
+        states = torch.tensor(np.array(self.buffer.states), dtype=torch.float32)
+        agent_ids = torch.tensor(np.array(self.buffer.agent_ids), dtype=torch.long)
         values = []
         for s, aid in zip(states, agent_ids):
             x = torch.cat([s, F.one_hot(aid, self.num_agents).float()])
@@ -134,7 +134,7 @@ class MAPPOAgent(Agent):
                 a = actions[batch]
                 old_lp = old_log_probs[batch]
                 inps = torch.cat([s, F.one_hot(ids, self.num_agents).float()], dim=1)
-                logits = self.action(inps)
+                logits = self.actor(inps)
                 probs = F.softmax(logits, dim=-1)
                 dist = Categorical(probs)
                 log_probs = dist.log_prob(a)
@@ -145,7 +145,7 @@ class MAPPOAgent(Agent):
                 actor_loss = -torch.min(surr1, surr2).mean()
 
                 values = self.critic(inps).squeeze()
-                critic_loss = F.mse_losss(values, returns[batch])
+                critic_loss = F.mse_loss(values, returns[batch])
 
                 loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
 
