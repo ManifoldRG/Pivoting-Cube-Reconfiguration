@@ -31,6 +31,10 @@ class OccupancyGridMap:
     self.module_positions, self.final_module_positions = self.recenter_initial_positions(
         module_positions, final_module_positions, grid_size)
     
+    # print(self.module_positions)
+    # print(self.final_module_positions)
+    # print(n)
+
     # Initialize grid maps with recentered module positions
     for module, pos in self.module_positions.items():
         self.grid_map[pos[0], pos[1], pos[2]] = module
@@ -236,8 +240,8 @@ class OccupancyGridMap:
   def calc_possible_actions(self): # need to check now that neighbor is free
     self.possible_actions = {}
     self.articulation_points = set(self.articulationPoints(len(self.modules), self.edges))
-    print("articulation_points\n")
-    print(self.articulation_points)
+    # print("articulation_points\n")
+    # print(self.articulation_points)
 
     for m in self.modules:
       #ipdb.set_trace()
@@ -267,11 +271,11 @@ class OccupancyGridMap:
           self.possible_actions[m] = pa
           #print(p)
           #ipdb.set_trace()
-    print(f"Possible actions: ")
+    # print(f"Possible actions: ")
     #print(self.possible_actions)
 
-    for m in self.modules:
-      print(np.where(self.possible_actions[m])[0] + 1)
+    # for m in self.modules:
+    #   print(np.where(self.possible_actions[m])[0] + 1)
 
     return self.possible_actions
 
@@ -383,7 +387,7 @@ class OccupancyGridMap:
     self.recenter()
     self.edges = self.calculate_edges(self.modules, self.module_positions)
     
-    print(f"Module Positions: {self.module_positions}")
+    # print(f"Module Positions: {self.module_positions}")
     #print(f"Curr Grid Map: {self.curr_grid_map}")
 
   def rotation_matrices(self):
@@ -412,6 +416,7 @@ class OccupancyGridMap:
         new_pos = new_pos.astype(int)
         new_pos = np.add(new_pos, self.recenter_to)
         #ipdb.set_trace()
+        # print(new_pos)
         temp_grid_map[new_pos[0], new_pos[1], new_pos[2]] = m
 
       self.final_grid_maps.append(temp_grid_map)
@@ -438,8 +443,8 @@ class OccupancyGridMap:
         if np.sum(np.abs(np.subtract(pos_m, pos_n))) == 1:
           edges.append([m-1,n-1])
 
-    print("edges:")
-    print(edges)
+    # print("edges:")
+    # print(edges)
     return edges
 
 
@@ -493,8 +498,8 @@ class OccupancyGridMap:
 
       #ipdb.set_trace()
       adj = self.constructAdj(V, edges)
-      print("adjacency:")
-      print(adj)
+      # print("adjacency:")
+      # print(adj)
       disc = [0] * V
       low = [0] * V
       visited = [0] * V

@@ -16,7 +16,7 @@ class OGMEnv:
     def reset(self, initial_config, final_config):
         self.ogm = OccupancyGridMap(initial_config, final_config, len(initial_config))
         self.steps_taken = 0
-        return self.ogm.get_observation()
+        return self.get_observation()
     
     def step(self, action):
         if self.ogm is None:

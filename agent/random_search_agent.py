@@ -1,4 +1,5 @@
 from agent.base_agent import Agent
+import numpy as np
 
 class RandomSearchAgent(Agent):
     def __init__(self, max_steps=1000):
