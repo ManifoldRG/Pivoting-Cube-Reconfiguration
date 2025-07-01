@@ -1,3 +1,4 @@
+import logging
 import numpy as np
 ## Need to generate random configuration 
 ## Model it as a 3D graph with 1 connected component
@@ -44,9 +45,8 @@ def make_connected_positions(n, grid_size, starter = None):
             if found:
                 break
 
-    print(n)
-    print(positions)
-    print("----")
+    logging.debug("Generated connected positions for %s modules", n)
+    logging.debug(positions)
     return positions
 
     # Start root at 

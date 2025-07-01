@@ -23,11 +23,18 @@ class OGMEnv:
             raise Exception("Environment not set. call reset function")
 
         module, pivot = action
-        self.ogm.take_action(module, pivot)
-        self.steps_taken += 1
-        done = self.ogm.check_final()
-        reward = 1.0 if done else self.step_cost
+        if self.ogm.calc_possible_actions()[module][pivot-1]:
+            self.ogm.take_action(module, pivot)
+            self.steps_taken += 1
+            done = self.ogm.check_final()
+            reward = 100.0 if done else self.step_cost
+            if not done and self.ogm.module_positions[module] == self.ogm.final_module_positions[module]:
+                reward=0.5
 
+        else:
+            self.steps_taken += 1
+            done = False
+            reward = -0.01 + self.step_cost
         ## This will allow ogm to stop at some point?? Not sure if will be useful
         if self.max_steps is not None and self.steps_taken >= self.max_steps:
             done = True

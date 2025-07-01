@@ -12,11 +12,15 @@ class StepVisualizer:
         self.ogm = ogm
         self.output_path = output_path
         self.frames = []
+        self.final_state = list(ogm.final_module_positions.values())
 
     def capture_state(self):
         """Capture current grid state as a list of module positions"""
         module_positions = list(self.ogm.module_positions.values())
         self.frames.append(module_positions.copy())
+
+    def set_final_state(self, final_module_positions):
+        self.final_state = list(final_module_positions.values())
 
     def draw_cube(self, ax, position, color='skyblue', alpha=0.9):
         x, y, z = position
@@ -44,6 +48,10 @@ class StepVisualizer:
             ax.set_ylabel("Y")
             ax.set_zlabel("Z")
             ax.set_title(f"Step {frame_idx + 1}")
+
+            if self.final_state:
+                for pos in self.final_state:
+                    self.draw_cube(ax, pos, color='red', alpha=0.4)
     
             for pos in self.frames[frame_idx]:
                 self.draw_cube(ax, pos)
@@ -67,11 +75,15 @@ class StepVisualizer:
             actual_idx = min(frame_idx, len(self.frames) - 1)
             ax.set_title(f"Step {actual_idx + 1}")
 
+            if self.final_state:
+                for pos in self.final_state:
+                    self.draw_cube(ax, pos, color='red', alpha=0.4)
+
             for pos in self.frames[actual_idx]:
                 self.draw_cube(ax, pos)
 
         total_frames = len(self.frames) + pause_frames
-        ani = animation.FuncAnimation(fig, update, frames=total_frames, interval=500)
+        ani = animation.FuncAnimation(fig, update, frames=total_frames, interval=0.05)
 
         writer = PillowWriter(fps=2, metadata={"loop": 0})
         ani.save(self.output_path, writer=writer)

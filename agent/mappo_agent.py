@@ -1,3 +1,4 @@
+import logging
 import numpy as np
 import torch
 import torch.nn as nn
@@ -9,7 +10,13 @@ from agent.base_agent import Agent
 class Actor(nn.Module):
     def __init__(self, input_dim, action_dim, hidden_dim=128):
         super().__init__()
-        print(input_dim, hidden_dim, action_dim)
+        logging.debug(
+            "Actor initialized with input_dim=%d hidden_dim=%d action_dim=%d",
+            input_dim,
+            hidden_dim,
+            action_dim
+        )
+        # print(input_dim, hidden_dim, action_dim)
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
@@ -44,6 +51,7 @@ class RolloutBuffer:
         self.rewards = []
         self.dones = []
         self.agent_ids = []
+        self.action_masks = []
 
     def clear(self):
         self.__init__()
@@ -71,10 +79,13 @@ class MAPPOAgent(Agent):
         one_hot[agent_id] = 1.0
         return torch.cat([obs_flat, one_hot])
     
-    def select_action(self, obs, agent_id):
+    def select_action(self, obs, agent_id, mask=None):
         with torch.no_grad():
             x = self._process_obs(obs, agent_id)
             logits = self.actor(x)
+            if mask is not None:
+                m = torch.tensor(mask, dtype=torch.bool)
+                logits = logits.masked_fill(~m, -1e9)
             probs = F.softmax(logits, dim=-1)
             dist = Categorical(probs)
             action = dist.sample()
@@ -82,14 +93,15 @@ class MAPPOAgent(Agent):
 
         return action.item(), log_prob.item()
     
-    def store(self, obs, agent_id, action, log_prob, reward, done):
+    def store(self, obs, agent_id, action, log_prob, reward, done, mask):
         self.buffer.states.append(obs.flatten())
         self.buffer.agent_ids.append(agent_id)
         self.buffer.actions.append(action)
         self.buffer.log_probs.append(log_prob)
         self.buffer.rewards.append(reward)
         self.buffer.dones.append(done)
-
+        self.buffer.action_masks.append(mask)
+    
     def _compute_returns_adv(self):
         rewards = self.buffer.rewards
         dones = self.buffer.dones
@@ -114,16 +126,24 @@ class MAPPOAgent(Agent):
         advs = torch.tensor(advs, dtype=torch.float32)
         returns = torch.tensor(returns, dtype=torch.float32)
         advs = (advs - advs.mean()) / (advs.std() + 1e-8)
-        return states, agent_ids, returns, advs
+        masks = self.buffer.action_masks
+        return states, agent_ids, returns, advs, masks
     
     def update(self):
         if len(self.buffer.states) == 0:
-            return
+            return {}
         
-        states, agent_ids, returns, advs = self._compute_returns_adv()
+        states, agent_ids, returns, advs, masks = self._compute_returns_adv()
         actions = torch.tensor(self.buffer.actions, dtype=torch.long)
         old_log_probs = torch.tensor(self.buffer.log_probs, dtype=torch.float32)
+        masks = torch.tensor(np.array(masks), dtype=torch.bool)
         dataset_size = len(actions)
+
+
+        total_actor_loss = 0.0
+        total_critic_loss = 0.0
+        total_entropy = 0.0
+        batches = 0
 
         for _ in range(self.epochs):
             idx = np.random.permutation(dataset_size)
@@ -135,6 +155,8 @@ class MAPPOAgent(Agent):
                 old_lp = old_log_probs[batch]
                 inps = torch.cat([s, F.one_hot(ids, self.num_agents).float()], dim=1)
                 logits = self.actor(inps)
+                mask = masks[batch]
+                logits = logits.masked_fill(~mask, -1e9)
                 probs = F.softmax(logits, dim=-1)
                 dist = Categorical(probs)
                 log_probs = dist.log_prob(a)
@@ -153,4 +175,29 @@ class MAPPOAgent(Agent):
                 loss.backward()
                 self.optimizer.step()
 
+                total_actor_loss += actor_loss.item()
+                total_critic_loss += critic_loss.item()
+                total_entropy += entropy.item()
+                batches += 1
+
         self.buffer.clear()
+
+        if batches == 0:
+            return {}
+        
+        return {
+            "actor_loss": total_actor_loss / batches,
+            "critic_loss": total_critic_loss / batches, 
+            "entropy": total_entropy / batches,
+        }
+    
+    def save(self, path):
+        torch.save({
+            "actor": self.actor.state_dict(),
+            "critic": self.critic.state_dict()
+        }, path)
+
+    def load(self, path):
+        ckpt = torch.load(path, map_location='cpu')
+        self.actor.load_state_dict(ckpt['actor'])
+        self.critic.load_state_dict(ckpt['critic'])
