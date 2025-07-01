@@ -31,9 +31,6 @@ class OccupancyGridMap:
     self.module_positions, self.final_module_positions = self.recenter_initial_positions(
         module_positions, final_module_positions, grid_size)
     
-    # print(self.module_positions)
-    # print(self.final_module_positions)
-    # print(n)
 
     # Initialize grid maps with recentered module positions
     for module, pos in self.module_positions.items():
@@ -47,14 +44,7 @@ class OccupancyGridMap:
     self.recenter_to = self.module_positions[1]
     self.modules = range(1, n+1)
     self.edges = self.calculate_edges(self.modules, self.module_positions)
-    try:
-      self.rotation_matrices()
-    except:
-      print(self.module_positions)
-      print(self.final_module_positions)
-      print(n)
-      self.rotation_matrices()
-
+    self.rotation_matrices()
     self.init_actions()
 
   def calculate_grid_size(self, n):
