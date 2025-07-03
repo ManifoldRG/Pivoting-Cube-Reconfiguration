@@ -399,9 +399,11 @@ class OccupancyGridMap:
 
     self.rotmats = [rx1, rx2, rx3, ry1, ry2, ry3, rz1, rz2, rz3]
     self.final_grid_maps = [self.final_grid_map]
+    self.final_rotated_module_positions = [self.final_module_positions]
 
     for i in range(9):
       temp_grid_map = np.zeros(self.curr_grid_map.shape)
+      temp_final_rotated_module_positions = {}
       rotmat = self.rotmats[i]
 
       for m in self.modules:
@@ -411,10 +413,12 @@ class OccupancyGridMap:
         new_pos = np.rint(new_pos)
         new_pos = new_pos.astype(int)
         new_pos = np.add(new_pos, self.recenter_to)
+        temp_final_rotated_module_positions[m] = new_pos
         #ipdb.set_trace()
         temp_grid_map[new_pos[0], new_pos[1], new_pos[2]] = m
 
       self.final_grid_maps.append(temp_grid_map)
+      self.final_rotated_module_positions.append(temp_final_rotated_module_positions)
     # print(f"Final grid maps: {self.final_grid_maps}")
 
   def check_final(self):
