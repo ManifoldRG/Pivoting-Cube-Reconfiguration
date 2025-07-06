@@ -1,4 +1,4 @@
-from MSSA.agent.base_agent import Agent
+from agent.base_agent import Agent
 import math
 import numpy as np
 
@@ -10,7 +10,13 @@ class ModuleAgent(Agent):
         self.success = False
         self.module = module
         self.ogm = ogm
-        self.calc_final_coords(ogm)
+        self.calc_final_coords()
+        self.calc_final_local_maps()
+        self.past_v_final_local_map = set() 
+        self.curr_v_final_local_map = self.calc_curr_v_final_local_map()
+        self.past_v_final_local_map = self.curr_v_final_local_map
+        
+        
         
     def get_coords(self, ogm):
         return ogm.module_positions[self.module]
@@ -29,16 +35,15 @@ class ModuleAgent(Agent):
         for i in range(6):
             if limits[i] < 0:
                 limits[i] =  0
-            elif limits[i] >= ogm_shape(math.floor(i / 2)):
-                limits[i] = ogm_shape(math.floor(i / 2)) - 1
+            elif limits[i] >= ogm_shape[math.floor(i / 2)]:
+                limits[i] = ogm_shape[math.floor(i / 2)] - 1
         
-        return ogm.curr_grid_map[limits[0]:limits[1], limits[2]:limits[3], limits[4]:limits[5]]
+        return self.ogm.curr_grid_map[limits[0]:(limits[1] + 1), limits[2]:(limits[3] + 1), limits[4]:(limits[5] + 1)]
     
     def calc_final_local_maps(self):
         self.final_local_maps = []
 
         for i in range(len(self.ogm.final_grid_maps)):
-            #origin = self.get_final_coords(ogm)
             origin = self.final_coords[i]
             ogm_shape = self.ogm.curr_grid_map.shape
             limits = [origin[0] - 2, origin[0] + 2, origin[1] - 2, origin[1] + 2, origin[2] - 2, origin[2] + 2]
@@ -47,12 +52,10 @@ class ModuleAgent(Agent):
             for i in range(6):
                 if limits[i] < 0:
                     limits[i] =  0
-                elif limits[i] >= ogm_shape(math.floor(i / 2)):
-                    limits[i] = ogm_shape(math.floor(i / 2)) - 1
-            self.final_local_maps.append(temp_final_map[limits[0]:limits[1], limits[2]:limits[3], limits[4]:limits[5]])
-        
-        #return ogm.final_grid_map[limits[0]:limits[1], limits[2]:limits[3], limits[4]:limits[5]]
-    
+                elif limits[i] >= ogm_shape[math.floor(i / 2)]:
+                    limits[i] = ogm_shape[math.floor(i / 2)] - 1
+            self.final_local_maps.append(temp_final_map[limits[0]:limits[1] + 1, limits[2]:limits[3] + 1, limits[4]:limits[5] + 1])
+            
     def calc_curr_v_final_local_map(self):
         local_map = self.get_local_map()
         min_set = set()
@@ -61,10 +64,15 @@ class ModuleAgent(Agent):
             temp_mask = local_map == self.final_local_maps[i]
             temp_set = set(local_map[temp_mask].flatten())
             
-            if len(temp_set) < len(min_set):
+            if len(temp_set) >= len(min_set):
                 min_set = temp_set
 
         return min_set
+
+    def calc_self_reward(self):
+        return len(self.curr_v_final_local_map - self.past_v_final_local_map) - len(self.past_v_final_local_map - self.curr_v_final_local_map)
     
     def get_messages(self, comms_hub):
         return (comms_hub.get_messages(self, self.module)) # placeholder method for a placeholder comms hub class; it might need more inputs
+    
+    
