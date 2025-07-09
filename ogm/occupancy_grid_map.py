@@ -563,3 +563,18 @@ class OccupancyGridMap:
             
             self.final_local_maps[module_id].append(temp_final_map[limits[0]:limits[1] + 1, limits[2]:limits[3] + 1, limits[4]:limits[5] + 1])
             
+
+  # Is it ok to take min_set, or should we compare it across all module_id and then take one which reduces the global? 
+  # maybe two different reward functions can be made based on different configs
+  def calc_curr_v_final_local_map(self, module_id):
+      local_map = self.get_local_map(module_id)
+      min_set = set()
+
+      for flm in self.final_local_maps[module_id]:
+          temp_mask = local_map == flm
+          temp_set = set(local_map[temp_mask].flatten())
+
+          if len(temp_set) >= len(min_set):
+              min_set = temp_set
+
+      return min_set

@@ -20,7 +20,7 @@ class TestModuleAgent(unittest.TestCase):
         # Validate that modules identified as articulation points have no pivot actions
         ogm = occupancy_grid_map.OccupancyGridMap(curr_positions, final_positions, len(curr_positions))
         test_agent = module_agent.ModuleAgent(2, ogm)
-        min_set = test_agent.calc_curr_v_final_local_map()
+        min_set = test_agent.ogm.calc_curr_v_final_local_map(2)
         
         # Check full articulation list matches expected
         self.assertEqual(expected_set_length, len(min_set),
