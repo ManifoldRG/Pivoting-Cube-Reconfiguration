@@ -11,7 +11,7 @@ class TestModuleAgent(unittest.TestCase):
 
     def assert_module_local_map_match(self, expected_local_map, module, ogm):
         test_agent = module_agent.ModuleAgent(module, ogm)
-        local_map = test_agent.get_local_map()
+        local_map = test_agent.ogm.get_local_map(module)
         self.assertTrue(np.all(local_map == expected_local_map),
                          msg=f"{expected_local_map} \nis the expected local map but we got \n{local_map}")
 

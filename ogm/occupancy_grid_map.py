@@ -45,6 +45,9 @@ class OccupancyGridMap:
     self.edges = self.calculate_edges(self.modules, self.module_positions)
     self.rotation_matrices()
     self.init_actions()
+    self.calc_final_coords()
+    self.calc_final_local_maps()
+
 
   def calculate_grid_size(self, n):
     """Calculate grid size based on number of modules.
@@ -517,3 +520,46 @@ class OccupancyGridMap:
 
       # If no articulation points are found, return list containing -1
       return result if result else [-1]
+
+
+  def calc_final_coords(self):
+    self.final_coords = {}
+    for module_id in self.modules:
+      self.final_coords[module_id] = []
+      for pos in self.final_rotated_module_positions:
+        self.final_coords[module_id].append(pos[module_id])
+
+
+  def get_local_map(self, module_id):
+    origin = self.module_positions[module_id]
+    ogm_shape = self.curr_grid_map.shape
+    limits = [origin[x] + y for x in [0, 1, 2] for y in [-2, 2]]
+
+    for i in range(6):
+      if limits[i] < 0:
+        limits[i] = 0
+      elif limits[i] >= ogm_shape[i // 2]:
+        limits[i] = ogm_shape[i // 2] - 1
+      
+    return self.curr_grid_map[limits[0]: (limits[1]+1), limits[2]:(limits[3]+1), limits[4]:(limits[5]+1)]
+        
+      
+  def calc_final_local_maps(self):
+      self.final_local_maps = {}
+
+      for module_id in self.modules:
+        self.final_local_maps[module_id] = []
+        for i in range(len(self.final_grid_maps)):
+            origin = self.final_coords[module_id][i]
+            ogm_shape = self.curr_grid_map.shape
+            limits = [origin[x] + y for x in [0, 1, 2] for y in [-2, 2]]
+            temp_final_map = self.final_grid_maps[i]
+            
+            for i in range(6):
+              if limits[i] < 0:
+                limits[i] = 0
+              elif limits[i] >= ogm_shape[i // 2]:
+                limits[i] = ogm_shape[i // 2] - 1
+            
+            self.final_local_maps[module_id].append(temp_final_map[limits[0]:limits[1] + 1, limits[2]:limits[3] + 1, limits[4]:limits[5] + 1])
+            
