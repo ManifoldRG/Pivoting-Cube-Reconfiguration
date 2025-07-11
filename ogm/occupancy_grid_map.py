@@ -79,6 +79,7 @@ class OccupancyGridMap:
         raise ValueError("Module 1 must exist in the module positions dictionary")
     
     module1_pos = module_positions[1]
+    module1_final_pos = final_module_positions[1]
     
     # Calculate offset to move module 1 to grid center
     offset = (
@@ -96,13 +97,20 @@ class OccupancyGridMap:
             pos[2] + offset[2]
         )
     
+    # Calculate the "final" offset to move module 1 to grid center (in the case that module 1's final position deviates from its initial position)
+    final_offset = (
+        grid_center - module1_final_pos[0],
+        grid_center - module1_final_pos[1],
+        grid_center - module1_final_pos[2]
+    )
+
     # Apply offset to all final module positions
     recentered_final_positions = {}
     for module, pos in final_module_positions.items():
         recentered_final_positions[module] = (
-            pos[0] + offset[0],
-            pos[1] + offset[1],
-            pos[2] + offset[2]
+            pos[0] + final_offset[0],
+            pos[1] + final_offset[1],
+            pos[2] + final_offset[2]
         )
     
     return recentered_positions, recentered_final_positions
@@ -228,11 +236,6 @@ class OccupancyGridMap:
                    48: np.array([[0,0], [-1,1], [-2,0]]) # does the negative stuff work? # now switch which dimension stays the same
                    }
 
-    self.negative_y_ranges = {7,8,15,16}
-    self.negative_y_ranges = {}
-    self.negative_z_ranges = {23,24,31,32,39,40,47,48}
-    self.negative_z_ranges = {}
-
   def calc_possible_actions(self): # need to check now that neighbor is free
     self.possible_actions = {}
     self.articulation_points = set(self.articulationPoints(len(self.modules), self.edges))
@@ -254,12 +257,7 @@ class OccupancyGridMap:
           offset_y = module_position[1] + rangethingy[1]
           offset_z = module_position[2] + rangethingy[2]
 
-          if p in self.negative_y_ranges:
-            sliced = self.curr_grid_map[offset_x[0]:(offset_x[1] + 1), offset_y[0]:(None if offset_y[1]==0 else offset_y[1] - 1):-1, offset_z[0]:(offset_z[1] + 1)]
-          elif p in self.negative_z_ranges:
-            sliced = self.curr_grid_map[offset_x[0]:(offset_x[1] + 1), offset_y[0]:(offset_y[1] + 1), offset_z[0]:(None if offset_z[1]==0 else offset_z[1] - 1):-1]
-          else:
-            sliced = self.curr_grid_map[offset_x[0]:(offset_x[1] + 1), offset_y[0]:(offset_y[1] + 1), offset_z[0]:(offset_z[1] + 1)]
+          sliced = self.curr_grid_map[offset_x[0]:(offset_x[1] + 1), offset_y[0]:(offset_y[1] + 1), offset_z[0]:(offset_z[1] + 1)]
 
           booled = np.squeeze(sliced > 0)
           pa = self.possible_actions[m]
