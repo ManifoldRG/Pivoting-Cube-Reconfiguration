@@ -275,109 +275,10 @@ class OccupancyGridMap:
 
   def take_action(self, module, action):
     module_position = self.module_positions[module]
-
-    match action:
-      case 1:
-        new_module_position = (module_position[0] + 1, module_position[1], module_position[2])
-      case 2:
-        new_module_position = (module_position[0] + 1, module_position[1] - 1, module_position[2])
-      case 3:#
-        new_module_position = (module_position[0] + 1, module_position[1], module_position[2])
-      case 4:
-        new_module_position = (module_position[0] + 1, module_position[1] + 1, module_position[2])
-      case 5:
-        new_module_position = (module_position[0], module_position[1] + 1, module_position[2])
-      case 6:
-        new_module_position = (module_position[0] + 1, module_position[1] + 1, module_position[2])
-      case 7:
-        new_module_position = (module_position[0], module_position[1] - 1, module_position[2])
-      case 8:
-        new_module_position = (module_position[0] + 1, module_position[1] - 1, module_position[2])
-      case 9:
-        new_module_position = (module_position[0] - 1, module_position[1], module_position[2])
-      case 10:
-        new_module_position = (module_position[0] - 1, module_position[1] - 1, module_position[2])
-      case 11:
-        new_module_position = (module_position[0] - 1, module_position[1], module_position[2])
-      case 12:#
-        new_module_position = (module_position[0] - 1, module_position[1] + 1, module_position[2])
-      case 13:
-        new_module_position = (module_position[0], module_position[1] + 1, module_position[2])
-      case 14:
-        new_module_position = (module_position[0] - 1, module_position[1] + 1, module_position[2])
-      case 15:
-        new_module_position = (module_position[0], module_position[1] - 1, module_position[2])
-      case 16:#####################
-        new_module_position = (module_position[0] - 1, module_position[1] - 1, module_position[2])
-      case 17:
-        new_module_position = (module_position[0] + 1, module_position[1], module_position[2])
-      case 18:
-        new_module_position = (module_position[0] + 1, module_position[1], module_position[2] - 1) #fixed
-      case 19:#
-        new_module_position = (module_position[0] + 1, module_position[1], module_position[2])
-      case 20:
-        new_module_position = (module_position[0] + 1, module_position[1], module_position[2] + 1) #fixed
-      case 21:
-        new_module_position = (module_position[0], module_position[1], module_position[2] + 1) #fixed
-      case 22:
-        new_module_position = (module_position[0] + 1, module_position[1], module_position[2] + 1) #fixed
-      case 23:
-        new_module_position = (module_position[0], module_position[1], module_position[2] - 1) #fixed
-      case 24:
-        new_module_position = (module_position[0] + 1, module_position[1], module_position[2] - 1)
-      case 25:
-        new_module_position = (module_position[0] - 1, module_position[1], module_position[2])
-      case 26:
-        new_module_position = (module_position[0] - 1, module_position[1], module_position[2] - 1)
-      case 27:
-        new_module_position = (module_position[0] - 1, module_position[1], module_position[2])
-      case 28:#
-        new_module_position = (module_position[0] - 1, module_position[1], module_position[2] + 1)
-      case 29:
-        new_module_position = (module_position[0], module_position[1], module_position[2] + 1)
-      case 30:
-        new_module_position = (module_position[0] - 1, module_position[1], module_position[2] + 1)
-      case 31:
-        new_module_position = (module_position[0], module_position[1], module_position[2] - 1)
-      case 32:#####################
-        new_module_position = (module_position[0] - 1, module_position[1], module_position[2] - 1)
-      case 33:
-        new_module_position = (module_position[0], module_position[1] + 1, module_position[2])
-      case 34:
-        new_module_position = (module_position[0], module_position[1] + 1, module_position[2] - 1)
-      case 35:#
-        new_module_position = (module_position[0], module_position[1] + 1, module_position[2])
-      case 36:
-        new_module_position = (module_position[0], module_position[1] + 1, module_position[2] + 1)
-      case 37:
-        new_module_position = (module_position[0], module_position[1], module_position[2] + 1)
-      case 38:
-        new_module_position = (module_position[0], module_position[1] + 1, module_position[2] + 1) 
-      case 39:
-        new_module_position = (module_position[0], module_position[1], module_position[2] - 1)
-      case 40:
-        new_module_position = (module_position[0], module_position[1] + 1, module_position[2] - 1)
-      case 41:
-        new_module_position = (module_position[0], module_position[1] - 1, module_position[2])
-      case 42:
-        new_module_position = (module_position[0], module_position[1] - 1, module_position[2] - 1)
-      case 43:
-        new_module_position = (module_position[0], module_position[1] - 1, module_position[2])
-      case 44:#
-        new_module_position = (module_position[0], module_position[1] - 1, module_position[2] + 1)
-      case 45:
-        new_module_position = (module_position[0], module_position[1], module_position[2] + 1)
-      case 46:
-        new_module_position = (module_position[0], module_position[1] - 1, module_position[2] + 1)
-      case 47:
-        new_module_position = (module_position[0], module_position[1], module_position[2] - 1)
-      case 48:#####################
-        new_module_position = (module_position[0], module_position[1] - 1, module_position[2] - 1)
-
-
+    new_module_position = self._compute_new_position(module_position, action)
     self.curr_grid_map[module_position[0], module_position[1], module_position[2]] = 0
     self.curr_grid_map[new_module_position[0], new_module_position[1], new_module_position[2]] = module
-    self.module_positions[module] =new_module_position
+    self.module_positions[module] = new_module_position
     self.recenter()
     self.edges = self.calculate_edges(self.modules, self.module_positions)
     
@@ -416,12 +317,8 @@ class OccupancyGridMap:
     # print(f"Final grid maps: {self.final_grid_maps}")
 
   def check_final(self):
-    #ipdb.set_trace()
-    for i in range(len(self.final_grid_maps)):
-      if np.all(self.curr_grid_map == self.final_grid_maps[i]):
-        return True
-    return False
-    #return np.all(self.curr_grid_map == self.final_grid_map)
+    # Only check against the primary (non-rotated) goal configuration.
+    return bool(np.all(self.curr_grid_map == self.final_grid_map))
   # need to check relative positions of modules, maybe with a connectivity graph
 
   # need to calculate edges first
@@ -511,3 +408,204 @@ class OccupancyGridMap:
 
       # If no articulation points are found, return list containing -1
       return result if result else [-1]
+
+  def _compute_new_position(self, module_position, action):
+      if action == 0:
+          return module_position
+      match action:
+          case 1:
+              return (module_position[0] + 1, module_position[1], module_position[2])
+          case 2:
+              return (module_position[0] + 1, module_position[1] - 1, module_position[2])
+          case 3:
+              return (module_position[0] + 1, module_position[1], module_position[2])
+          case 4:
+              return (module_position[0] + 1, module_position[1] + 1, module_position[2])
+          case 5:
+              return (module_position[0], module_position[1] + 1, module_position[2])
+          case 6:
+              return (module_position[0] + 1, module_position[1] + 1, module_position[2])
+          case 7:
+              return (module_position[0], module_position[1] - 1, module_position[2])
+          case 8:
+              return (module_position[0] + 1, module_position[1] - 1, module_position[2])
+          case 9:
+              return (module_position[0] - 1, module_position[1], module_position[2])
+          case 10:
+              return (module_position[0] - 1, module_position[1] - 1, module_position[2])
+          case 11:
+              return (module_position[0] - 1, module_position[1], module_position[2])
+          case 12:
+              return (module_position[0] - 1, module_position[1] + 1, module_position[2])
+          case 13:
+              return (module_position[0], module_position[1] + 1, module_position[2])
+          case 14:
+              return (module_position[0] - 1, module_position[1] + 1, module_position[2])
+          case 15:
+              return (module_position[0], module_position[1] - 1, module_position[2])
+          case 16:
+              return (module_position[0] - 1, module_position[1] - 1, module_position[2])
+          case 17:
+              return (module_position[0] + 1, module_position[1], module_position[2])
+          case 18:
+              return (module_position[0] + 1, module_position[1], module_position[2] - 1)
+          case 19:
+              return (module_position[0] + 1, module_position[1], module_position[2])
+          case 20:
+              return (module_position[0] + 1, module_position[1], module_position[2] + 1)
+          case 21:
+              return (module_position[0], module_position[1], module_position[2] + 1)
+          case 22:
+              return (module_position[0] + 1, module_position[1], module_position[2] + 1)
+          case 23:
+              return (module_position[0], module_position[1], module_position[2] - 1)
+          case 24:
+              return (module_position[0] + 1, module_position[1], module_position[2] - 1)
+          case 25:
+              return (module_position[0] - 1, module_position[1], module_position[2])
+          case 26:
+              return (module_position[0] - 1, module_position[1], module_position[2] - 1)
+          case 27:
+              return (module_position[0] - 1, module_position[1], module_position[2])
+          case 28:
+              return (module_position[0] - 1, module_position[1], module_position[2] + 1)
+          case 29:
+              return (module_position[0], module_position[1], module_position[2] + 1)
+          case 30:
+              return (module_position[0] - 1, module_position[1], module_position[2] + 1)
+          case 31:
+              return (module_position[0], module_position[1], module_position[2] - 1)
+          case 32:
+              return (module_position[0] - 1, module_position[1], module_position[2] - 1)
+          case 33:
+              return (module_position[0], module_position[1] + 1, module_position[2])
+          case 34:
+              return (module_position[0], module_position[1] + 1, module_position[2] - 1)
+          case 35:
+              return (module_position[0], module_position[1] + 1, module_position[2])
+          case 36:
+              return (module_position[0], module_position[1] + 1, module_position[2] + 1)
+          case 37:
+              return (module_position[0], module_position[1], module_position[2] + 1)
+          case 38:
+              return (module_position[0], module_position[1] + 1, module_position[2] + 1)
+          case 39:
+              return (module_position[0], module_position[1], module_position[2] - 1)
+          case 40:
+              return (module_position[0], module_position[1] + 1, module_position[2] - 1)
+          case 41:
+              return (module_position[0], module_position[1] - 1, module_position[2])
+          case 42:
+              return (module_position[0], module_position[1] - 1, module_position[2] - 1)
+          case 43:
+              return (module_position[0], module_position[1] - 1, module_position[2])
+          case 44:
+              return (module_position[0], module_position[1] - 1, module_position[2] + 1)
+          case 45:
+              return (module_position[0], module_position[1], module_position[2] + 1)
+          case 46:
+              return (module_position[0], module_position[1] - 1, module_position[2] + 1)
+          case 47:
+              return (module_position[0], module_position[1], module_position[2] - 1)
+          case 48:
+              return (module_position[0], module_position[1] - 1, module_position[2] - 1)
+      return module_position
+
+  def get_new_position(self, module, action):
+      return self._compute_new_position(self.module_positions[module], action)
+
+  def execute_moves(self, moves_dict):
+      # Remove modules from their current positions
+      for module, new_pos in moves_dict.items():
+          old_pos = self.module_positions[module]
+          self.curr_grid_map[old_pos[0], old_pos[1], old_pos[2]] = 0
+      # Place modules at new positions
+      for module, new_pos in moves_dict.items():
+          self.curr_grid_map[new_pos[0], new_pos[1], new_pos[2]] = module
+          self.module_positions[module] = new_pos
+      self.recenter()
+      self.edges = self.calculate_edges(self.modules, self.module_positions)
+
+  def get_local_map(self, module, patch_size=5):
+      pos = self.module_positions[module]
+      half = patch_size // 2
+      x, y, z = pos
+      x_min = max(x - half, 0)
+      x_max = min(x + half + 1, self.curr_grid_map.shape[0])
+      y_min = max(y - half, 0)
+      y_max = min(y + half + 1, self.curr_grid_map.shape[1])
+      z_min = max(z - half, 0)
+      z_max = min(z + half + 1, self.curr_grid_map.shape[2])
+      local_map = np.zeros((patch_size, patch_size, patch_size), dtype=np.int8)
+      x_slice = slice(x_min, x_max)
+      y_slice = slice(y_min, y_max)
+      z_slice = slice(z_min, z_max)
+      local_map[
+          (x_min - (x - half)):(x_max - (x - half)),
+          (y_min - (y - half)):(y_max - (y - half)),
+          (z_min - (z - half)):(z_max - (z - half))
+      ] = self.curr_grid_map[x_slice, y_slice, z_slice]
+      return local_map
+
+  def get_final_local_map(self, module, patch_size=5):
+      pos = self.final_module_positions[module]
+      half = patch_size // 2
+      x, y, z = pos
+      x_min = max(x - half, 0)
+      x_max = min(x + half + 1, self.final_grid_map.shape[0])
+      y_min = max(y - half, 0)
+      y_max = min(y + half + 1, self.final_grid_map.shape[1])
+      z_min = max(z - half, 0)
+      z_max = min(z + half + 1, self.final_grid_map.shape[2])
+      local_map = np.zeros((patch_size, patch_size, patch_size), dtype=np.int8)
+      x_slice = slice(x_min, x_max)
+      y_slice = slice(y_min, y_max)
+      z_slice = slice(z_min, z_max)
+      local_map[
+          (x_min - (x - half)):(x_max - (x - half)),
+          (y_min - (y - half)):(y_max - (y - half)),
+          (z_min - (z - half)):(z_max - (z - half))
+      ] = self.final_grid_map[x_slice, y_slice, z_slice]
+      return local_map
+
+  def calculate_edges_from_positions(self, modules, module_positions):
+      edges = []
+      module_list = list(modules)
+      for i in range(len(module_list)):
+          for j in range(i + 1, len(module_list)):
+              m1_id = module_list[i]
+              m2_id = module_list[j]
+              pos_m = module_positions[m1_id]
+              pos_n = module_positions[m2_id]
+              if np.sum(np.abs(np.subtract(pos_m, pos_n))) == 1:
+                  edges.append([m1_id - 1, m2_id - 1])
+      return edges
+
+  def is_connected(self, positions_dict):
+      """
+      Checks if the graph formed by the given module positions is connected.
+      Returns True if connected, False otherwise.
+      """
+      if not positions_dict:
+          return True  # an empty set of modules is trivially connected
+      modules = list(positions_dict.keys())
+      edges = self.calculate_edges_from_positions(modules, positions_dict)
+      num_modules = len(modules)
+      adj = [[] for _ in range(num_modules)]
+      module_to_idx = {module_id: i for i, module_id in enumerate(modules)}
+      for u, v in edges:
+          u_idx, v_idx = module_to_idx[u+1], module_to_idx[v+1]
+          adj[u_idx].append(v_idx)
+          adj[v_idx].append(u_idx)
+      visited = [False] * num_modules
+      stack = [0]
+      visited[0] = True
+      count = 0
+      while stack:
+          u = stack.pop()
+          count += 1
+          for v in adj[u]:
+              if not visited[v]:
+                  visited[v] = True
+                  stack.append(v)
+      return count == num_modules
