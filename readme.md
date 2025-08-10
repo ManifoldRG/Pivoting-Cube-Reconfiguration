@@ -5,7 +5,7 @@
 
 #### Subsequent Setup:
 1. conda activate mssa
-2. source loadenv
+2. source env.sh
 
 
 ### 2. To run Tests
