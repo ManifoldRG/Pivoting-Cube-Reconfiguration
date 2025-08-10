@@ -1,4 +1,5 @@
 import numpy as np
+from collections import deque
 
 class OccupancyGridMap:
   def __init__(self, module_positions, final_module_positions, n):
@@ -25,6 +26,7 @@ class OccupancyGridMap:
     # Create grid maps with appropriate size
     self.grid_map = np.zeros((grid_size, grid_size, grid_size))
     self.curr_grid_map = np.zeros((grid_size, grid_size, grid_size))
+    self.pre_action_grid_map = np.zeros((grid_size, grid_size, grid_size)) # this will store the grid map as it is before the action step begins
     self.final_grid_map = np.zeros((grid_size, grid_size, grid_size))
     
     # Recenter module positions so that module 1 is at the center of the grid
@@ -44,8 +46,10 @@ class OccupancyGridMap:
     self.recenter_to = self.module_positions[1]
     self.modules = range(1, n+1)
     self.edges = self.calculate_edges(self.modules, self.module_positions)
+    #self.pre_action_edges = self.edges.copy()
     self.rotation_matrices()
     self.init_actions()
+    self.calc_pre_action_grid_map()
 
   def calculate_grid_size(self, n):
     """Calculate grid size based on number of modules.
@@ -237,8 +241,18 @@ class OccupancyGridMap:
                    48: np.array([[0,0], [-1,1], [-2,0]]) # does the negative stuff work? # now switch which dimension stays the same
                    }
 
-  def calc_possible_actions(self): # need to check now that neighbor is free
+  # return the queue of randomized modules:
+  def calc_queue(self):
+    arr = np.arange(1, len(self.modules)+1)
+    np.random.shuffle(arr)
+    return arr
+
+  def calc_possible_actions(self, module=None): # need to check now that neighbor is free
+    # need to add stuff to account for the pre_action_grid_map; need to have corresponding edges for the pre_action_grid_map
+    # what about module positions? Or maybe just calculate for a specific module???
+    # Do we ever require the full set of each module's actions? Don't we query each module individually? Does it matter?
     self.possible_actions = {}
+    self.possible_pre_actions = {}
     self.articulation_points = set(self.articulationPoints(len(self.modules), self.edges))
     # print("articulation_points\n")
     # print(self.articulation_points)
@@ -246,8 +260,9 @@ class OccupancyGridMap:
     for m in self.modules:
       #ipdb.set_trace()
       self.possible_actions[m] = np.array(list(range(48))) > 49
+      self.possible_pre_actions[m] = np.array(list(range(48))) > 49
 
-      if m not in self.articulation_points:
+      if (module is None or m == module) and m not in self.articulation_points and m not in self.pre_action_articulation_points:
         module_position = self.module_positions[m]
 
         # will go to 48
@@ -259,11 +274,18 @@ class OccupancyGridMap:
           offset_z = module_position[2] + rangethingy[2]
 
           sliced = self.curr_grid_map[offset_x[0]:(offset_x[1] + 1), offset_y[0]:(offset_y[1] + 1), offset_z[0]:(offset_z[1] + 1)]
+          pre_sliced = self.pre_action_grid_map[offset_x[0]:(offset_x[1] + 1), offset_y[0]:(offset_y[1] + 1), offset_z[0]:(offset_z[1] + 1)]
 
           booled = np.squeeze(sliced > 0)
           pa = self.possible_actions[m]
           pa[p - 1] = np.all(booled == self.potential_pivots[p])
           self.possible_actions[m] = pa
+
+          pre_booled = np.squeeze(pre_sliced > 0)
+          pre_pa = self.possible_pre_actions[m]
+          pre_pa[p - 1] = np.all(pre_booled == self.potential_pivots[p]) 
+          self.possible_pre_actions[m] = pre_pa
+          self.possible_actions[m] = pa & pre_pa
           #print(p)
           #ipdb.set_trace()
     # print(f"Possible actions: ")
@@ -384,6 +406,14 @@ class OccupancyGridMap:
     
     # print(f"Module Positions: {self.module_positions}")
     #print(f"Curr Grid Map: {self.curr_grid_map}")
+
+  # once all modules have taken their action during the action phase, we will reset the pre_action_grid_map to curr_grid_map
+  def calc_pre_action_grid_map(self):
+    self.pre_action_grid_map = np.empty_like(self.curr_grid_map)
+    self.pre_action_grid_map[:] = self.curr_grid_map
+    self.pre_action_edges = self.edges.copy()
+    self.pre_action_articulation_points = set(self.articulationPoints(len(self.modules), self.pre_action_edges))
+
 
   def rotation_matrices(self):
     rx1 = np.array([[1, 0, 0], [0, np.cos(np.pi / 2), -np.sin(np.pi / 2)], [0, np.sin(np.pi / 2), np.cos(np.pi / 2)]])
