@@ -94,7 +94,7 @@ class TestOGMPossibleActions(unittest.TestCase):
             2: [],
             3: [14, 15, 30, 32]
         }
-        expected_actions = {1:[3, 12, 38, 40], 2:[], 3:[14, 15, 30, 32]}
+        expected_actions = {1:[3, 12, 38, 40, 49], 2:[49], 3:[14, 15, 30, 32, 49]}
 
         # Expected articulation point
         expected_aticulation_points = [2]
@@ -104,54 +104,29 @@ class TestOGMPossibleActions(unittest.TestCase):
         self.assert_possible_actions_match(module_positions, expected_actions)
 
     def test_configuration_case2(self):
-        self.assert_possible_actions_match({1:(4,4,4), 2:(4,5,4), 3:(5,5,4)}, {1:[3, 12, 38, 40], 2:[], 3:[14, 15, 30, 32]})
+        self.assert_possible_actions_match({1:(4,4,4), 2:(4,5,4), 3:(5,5,4)}, {1:[3, 12, 38, 40, 49], 2:[49], 3:[14, 15, 30, 32, 49]})
     def test_configuration_case3(self):
-        self.assert_possible_actions_match({1:(4,4,4), 2:(4,3,4), 3:(5,3,4)}, {1:[1, 10, 46, 48], 2:[], 3:[13, 16, 30, 32]})
+        self.assert_possible_actions_match({1:(4,4,4), 2:(4,3,4), 3:(5,3,4)}, {1:[1, 10, 46, 48, 49], 2:[49], 3:[13, 16, 30, 32, 49]})
     def test_configuration_case4(self):
-        self.assert_possible_actions_match({1:(4,4,4), 2:(5, 4, 4), 3:(5, 3,4)}, {1:[7, 6, 22, 24], 2:[], 3: [11, 4, 38, 40]})
+        self.assert_possible_actions_match({1:(4,4,4), 2:(5, 4, 4), 3:(5, 3,4)}, {1:[7, 6, 22, 24, 49], 2:[49], 3: [11, 4, 38, 40, 49]})
     def test_configuration_case5(self):
-        self.assert_possible_actions_match({1:(4,4,4), 2:(5,4,4), 3:(5,5,4)}, {1:[5, 8, 22, 24], 2:[], 3:[9, 2, 46, 48]})
+        self.assert_possible_actions_match({1:(4,4,4), 2:(5,4,4), 3:(5,5,4)}, {1:[5, 8, 22, 24, 49], 2:[49], 3:[9, 2, 46, 48, 49]})
     def test_configuration_case6(self):
-        self.assert_possible_actions_match({1:(4,4,4), 2:(4,5,4), 3:(4,5,3)}, {1:[39, 38, 4, 12], 2:[], 3:[43, 36, 20, 28]})
+        self.assert_possible_actions_match({1:(4,4,4), 2:(4,5,4), 3:(4,5,3)}, {1:[39, 38, 4, 12, 49], 2:[49], 3:[43, 36, 20, 28, 49]})
     def test_configuration_case7(self):
-        self.assert_possible_actions_match({1:(4,4,4), 2:(4,3,4), 3:(4,3,3)}, {1:[47, 46, 2, 10], 2:[], 3:[35, 44, 20, 28]})
+        self.assert_possible_actions_match({1:(4,4,4), 2:(4,3,4), 3:(4,3,3)}, {1:[47, 46, 2, 10, 49], 2:[49], 3:[35, 44, 20, 28, 49]})
     def test_configuration_case8(self):
-        self.assert_possible_actions_match({1:(4,4,4), 2:(4,5,4), 3:(4,5,5)}, {1:[37, 40, 4, 12], 2:[], 3:[41, 34, 18, 26]})
+        self.assert_possible_actions_match({1:(4,4,4), 2:(4,5,4), 3:(4,5,5)}, {1:[37, 40, 4, 12, 49], 2:[49], 3:[41, 34, 18, 26, 49]})
     def test_configuration_case9(self):
-        self.assert_possible_actions_match({1:(4,4,4), 2:(4,3,4), 3:(4,3,5)}, {1:[45, 48, 2, 10], 2:[], 3:[33, 42, 18, 26]})
+        self.assert_possible_actions_match({1:(4,4,4), 2:(4,3,4), 3:(4,3,5)}, {1:[45, 48, 2, 10, 49], 2:[49], 3:[33, 42, 18, 26, 49]})
     def test_configuration_case10(self):
-        self.assert_possible_actions_match({1:(4,4,4), 2:(3,4,4), 3:(3,4,5)}, {1:[29, 32, 14, 16], 2:[], 3:[17, 26, 34, 42]})
+        self.assert_possible_actions_match({1:(4,4,4), 2:(3,4,4), 3:(3,4,5)}, {1:[29, 32, 14, 16, 49], 2:[49], 3:[17, 26, 34, 42, 49]})
     def test_configuration_case11(self):
-        self.assert_possible_actions_match({1:(4,4,4), 2:(3,4,4), 3:(3,4,3)}, {1:[31, 30, 14, 16], 2:[], 3:[19, 28, 36, 44]})
+        self.assert_possible_actions_match({1:(4,4,4), 2:(3,4,4), 3:(3,4,3)}, {1:[31, 30, 14, 16, 49], 2:[49], 3:[19, 28, 36, 44, 49]})
     def test_configuration_case12(self):
-        self.assert_possible_actions_match({1:(4,4,4), 2:(5,4,4), 3:(5,4,5)}, {1:[21, 24, 6, 8], 2:[], 3:[25, 18, 34, 42]})
+        self.assert_possible_actions_match({1:(4,4,4), 2:(5,4,4), 3:(5,4,5)}, {1:[21, 24, 6, 8, 49], 2:[49], 3:[25, 18, 34, 42, 49]})
     def test_configuration_case13(self):
-        self.assert_possible_actions_match({1:(4,4,4), 2:(5,4,4), 3:(5,4,3)}, {1:[23, 22, 6, 8], 2:[], 3:[27, 20, 36, 44]})
-
-    def test_configuration_case2(self):
-        self.assert_possible_actions_match({1:(4,4,4), 2:(4,5,4), 3:(5,5,4)}, {1:[3, 12, 38, 40], 2:[], 3:[14, 15, 30, 32]})
-    def test_configuration_case3(self):
-        self.assert_possible_actions_match({1:(4,4,4), 2:(4,3,4), 3:(5,3,4)}, {1:[1, 10, 46, 48], 2:[], 3:[13, 16, 30, 32]})
-    def test_configuration_case4(self):
-        self.assert_possible_actions_match({1:(4,4,4), 2:(5, 4, 4), 3:(5, 3,4)}, {1:[7, 6, 22, 24], 2:[], 3: [11, 4, 38, 40]})
-    def test_configuration_case5(self):
-        self.assert_possible_actions_match({1:(4,4,4), 2:(5,4,4), 3:(5,5,4)}, {1:[5, 8, 22, 24], 2:[], 3:[9, 2, 46, 48]})
-    def test_configuration_case6(self):
-        self.assert_possible_actions_match({1:(4,4,4), 2:(4,5,4), 3:(4,5,3)}, {1:[39, 38, 4, 12], 2:[], 3:[43, 36, 20, 28]})
-    def test_configuration_case7(self):
-        self.assert_possible_actions_match({1:(4,4,4), 2:(4,3,4), 3:(4,3,3)}, {1:[47, 46, 2, 10], 2:[], 3:[35, 44, 20, 28]})
-    def test_configuration_case8(self):
-        self.assert_possible_actions_match({1:(4,4,4), 2:(4,5,4), 3:(4,5,5)}, {1:[37, 40, 4, 12], 2:[], 3:[41, 34, 18, 26]})
-    def test_configuration_case9(self):
-        self.assert_possible_actions_match({1:(4,4,4), 2:(4,3,4), 3:(4,3,5)}, {1:[45, 48, 2, 10], 2:[], 3:[33, 42, 18, 26]})
-    def test_configuration_case10(self):
-        self.assert_possible_actions_match({1:(4,4,4), 2:(3,4,4), 3:(3,4,5)}, {1:[29, 32, 14, 16], 2:[], 3:[17, 26, 34, 42]})
-    def test_configuration_case11(self):
-        self.assert_possible_actions_match({1:(4,4,4), 2:(3,4,4), 3:(3,4,3)}, {1:[31, 30, 14, 16], 2:[], 3:[19, 28, 36, 44]})
-    def test_configuration_case12(self):
-        self.assert_possible_actions_match({1:(4,4,4), 2:(5,4,4), 3:(5,4,5)}, {1:[21, 24, 6, 8], 2:[], 3:[25, 18, 34, 42]})
-    def test_configuration_case13(self):
-        self.assert_possible_actions_match({1:(4,4,4), 2:(5,4,4), 3:(5,4,3)}, {1:[23, 22, 6, 8], 2:[], 3:[27, 20, 36, 44]})
+        self.assert_possible_actions_match({1:(4,4,4), 2:(5,4,4), 3:(5,4,3)}, {1:[23, 22, 6, 8, 49], 2:[49], 3:[27, 20, 36, 44, 49]})
 
 if __name__ == "__main__":
     unittest.main()

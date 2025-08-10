@@ -259,8 +259,8 @@ class OccupancyGridMap:
 
     for m in self.modules:
       #ipdb.set_trace()
-      self.possible_actions[m] = np.array(list(range(48))) > 49
-      self.possible_pre_actions[m] = np.array(list(range(48))) > 49
+      self.possible_actions[m] = np.array(list(range(49))) >= 48
+      self.possible_pre_actions[m] = np.array(list(range(49))) >= 48
 
       if (module is None or m == module) and m not in self.articulation_points and m not in self.pre_action_articulation_points:
         module_position = self.module_positions[m]
@@ -396,6 +396,8 @@ class OccupancyGridMap:
         new_module_position = (module_position[0], module_position[1], module_position[2] - 1)
       case 48:#####################
         new_module_position = (module_position[0], module_position[1] - 1, module_position[2] - 1)
+      case 49:
+        new_module_position = self.module_positions[module]
 
 
     self.curr_grid_map[module_position[0], module_position[1], module_position[2]] = 0
