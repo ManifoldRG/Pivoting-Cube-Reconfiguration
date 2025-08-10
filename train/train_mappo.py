@@ -61,7 +61,11 @@ def train(args):
 
 
         while not done and step < args.max_steps:
-            for aid in range(0, args.num_agents):
+            random_queue = env.ogm.calc_queue()
+            env.ogm.calc_pre_action_grid_map()
+
+            for aid in random_queue:#range(0, args.num_agents):
+                aid = aid - 1
                 mask = env.ogm.calc_possible_actions()[aid + 1]
                 action, log_prob = agent.select_action(obs, aid, mask=mask)
                 # action, log_prob = agent.select_action(obs, aid)
