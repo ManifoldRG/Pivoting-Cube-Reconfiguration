@@ -72,10 +72,18 @@ def train(args):
             for aid in random_queue:#range(0, args.num_agents):
                 aid = aid - 1
                 mask = env.ogm.calc_possible_actions()[aid + 1]
-                action, log_prob = agent.select_action(obs, aid, mask=mask)
+                
+                # --- FIX: Store the current state before it gets overwritten ---
+                current_obs = obs
+                
+                action, log_prob = agent.select_action(current_obs, aid, mask=mask)
                 # action, log_prob = agent.select_action(obs, aid)
                 obs, reward, done, _ = env.step((aid+1, action+1))
-                agent.store(obs, aid, action, log_prob, reward, done, mask)
+                
+                # Pass the state that was used for the decision to the buffer
+                agent.store(current_obs, aid, action, log_prob, reward, done, mask)
+                # --- FIX ENDS HERE ---
+                
                 episode_reward += reward
                 step+=1
                 if visualizer:
