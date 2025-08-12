@@ -34,7 +34,11 @@ def train(args):
     init_conf, final_conf, grid_size = random_configuration(args.num_agents)
     env = OGMEnv(step_cost=-0.01, max_steps=args.max_steps)
     obs = env.reset(init_conf, final_conf)
+    
+    # obs_dim is now the size of ONE grid map. 
+    # The agent's __init__ will handle doubling it.
     obs_dim = grid_size ** 3
+    
     agent = MAPPOAgent(obs_dim, args.num_agents, action_dim=49, lr=args.lr, 
                        gamma=args.gamma, lam=args.lam, clip=args.clip, 
                        epochs=args.epochs, batch_size=args.batch_size)

@@ -23,19 +23,39 @@ class OGMEnv:
             raise Exception("Environment not set. call reset function")
 
         module, pivot = action
-        if self.ogm.calc_possible_actions()[module][pivot-1]:
-            self.ogm.take_action(module, pivot)
-            self.steps_taken += 1
-            done = self.ogm.check_final()
-            reward = 100.0 if done else self.step_cost
-            if not done and self.ogm.module_positions[module] == self.ogm.final_module_positions[module]:
-                reward=0.5
 
-        else:
-            self.steps_taken += 1
-            done = False
-            reward = -0.01 + self.step_cost
-        ## This will allow ogm to stop at some point?? Not sure if will be useful
+        # --- New Reward Logic ---
+        # 1. Calculate distance before the move
+        # Using a simple count of differing cells as the distance metric.
+        initial_distance = np.sum(self.ogm.curr_grid_map != self.ogm.final_grid_map)
+
+        # Execute the action
+        # NOTE: It's important to check if the action is valid BEFORE taking it.
+        is_valid_action = self.ogm.calc_possible_actions()[module][pivot-1]
+        
+        if is_valid_action:
+            self.ogm.take_action(module, pivot)
+        
+        self.steps_taken += 1
+
+        # 2. Check for success and calculate new distance
+        done = self.ogm.check_final()
+        final_distance = np.sum(self.ogm.curr_grid_map != self.ogm.final_grid_map)
+
+        # 3. Calculate the hybrid reward
+        # Reward for making progress toward the goal
+        potential_reward = initial_distance - final_distance 
+        
+        # Large bonus for completing the puzzle
+        success_bonus = 100.0 if done else 0.0
+        
+        # Small penalty for invalid moves to discourage them
+        invalid_move_penalty = -1.0 if not is_valid_action else 0.0
+
+        # Combine the components into the final reward for this step
+        reward = potential_reward + success_bonus + invalid_move_penalty + self.step_cost
+
+        # Stop if max steps are reached
         if self.max_steps is not None and self.steps_taken >= self.max_steps:
             done = True
 
@@ -44,8 +64,12 @@ class OGMEnv:
         return observation, reward, done, info
     
     def get_observation(self):
-
+        """
+        Stacks the current and final grid maps to create a 2-channel observation.
+        This allows the agent to see both its current state and its goal state.
+        """
         if self.ogm is None:
             raise Exception("Environment not set. call reset function")
-
-        return np.copy(self.ogm.curr_grid_map)
+        
+        # Shape becomes (2, grid_size, grid_size, grid_size)
+        return np.stack([self.ogm.curr_grid_map, self.ogm.final_grid_map], axis=0)
