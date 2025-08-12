@@ -24,13 +24,10 @@ class OGMEnv:
 
         module, pivot = action
 
-        # --- New Reward Logic ---
         # 1. Calculate distance before the move
-        # Using a simple count of differing cells as the distance metric.
         initial_distance = np.sum(self.ogm.curr_grid_map != self.ogm.final_grid_map)
 
         # Execute the action
-        # NOTE: It's important to check if the action is valid BEFORE taking it.
         is_valid_action = self.ogm.calc_possible_actions()[module][pivot-1]
         
         if is_valid_action:
@@ -43,7 +40,6 @@ class OGMEnv:
         final_distance = np.sum(self.ogm.curr_grid_map != self.ogm.final_grid_map)
 
         # 3. Calculate the hybrid reward
-        # Reward for making progress toward the goal
         potential_reward = initial_distance - final_distance 
         
         # Large bonus for completing the puzzle
@@ -55,7 +51,6 @@ class OGMEnv:
         # Combine the components into the final reward for this step
         reward = potential_reward + success_bonus + invalid_move_penalty + self.step_cost
 
-        # Stop if max steps are reached
         if self.max_steps is not None and self.steps_taken >= self.max_steps:
             done = True
 

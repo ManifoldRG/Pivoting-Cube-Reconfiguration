@@ -75,7 +75,6 @@ class MAPPOAgent(Agent):
         self.buffer = RolloutBuffer()
 
     def _process_obs(self, obs, agent_id):
-        # obs now has shape (2, grid, grid, grid), flatten it correctly.
         obs_flat = torch.tensor(obs.ravel(), dtype=torch.float32)
         one_hot = torch.zeros(self.num_agents)
         one_hot[agent_id] = 1.0

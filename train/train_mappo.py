@@ -35,8 +35,6 @@ def train(args):
     env = OGMEnv(step_cost=-0.01, max_steps=args.max_steps)
     obs = env.reset(init_conf, final_conf)
     
-    # obs_dim is now the size of ONE grid map. 
-    # The agent's __init__ will handle doubling it.
     obs_dim = grid_size ** 3
     
     agent = MAPPOAgent(obs_dim, args.num_agents, action_dim=49, lr=args.lr, 
@@ -73,7 +71,7 @@ def train(args):
                 aid = aid - 1
                 mask = env.ogm.calc_possible_actions()[aid + 1]
                 
-                # --- FIX: Store the current state before it gets overwritten ---
+                # Store the current state before it gets overwritten 
                 current_obs = obs
                 
                 action, log_prob = agent.select_action(current_obs, aid, mask=mask)
@@ -82,7 +80,6 @@ def train(args):
                 
                 # Pass the state that was used for the decision to the buffer
                 agent.store(current_obs, aid, action, log_prob, reward, done, mask)
-                # --- FIX ENDS HERE ---
                 
                 episode_reward += reward
                 step+=1
@@ -106,7 +103,6 @@ def train(args):
         if visualizer:
             visualizer.animate()
         
-        # Proper success detection to check if we actually reached the goal
         actual_success = env.ogm.check_final() if hasattr(env, 'ogm') and env.ogm else False
         success_count += int(actual_success)
         steps_per_episode.append(step)
