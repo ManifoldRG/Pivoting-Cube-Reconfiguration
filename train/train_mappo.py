@@ -35,12 +35,12 @@ def train(args):
     env = OGMEnv(step_cost=-0.01, max_steps=args.max_steps)
     obs = env.reset(init_conf, final_conf)
     obs_dim = grid_size ** 3
-    agent = MAPPOAgent(obs_dim, args.num_agents, action_dim=48, lr=args.lr, 
+    agent = MAPPOAgent(obs_dim, args.num_agents, action_dim=49, lr=args.lr, 
                        gamma=args.gamma, lam=args.lam, clip=args.clip, 
                        epochs=args.epochs, batch_size=args.batch_size)
     success_count = 0
     steps_per_episode = []
-
+    
     for ep in range(args.episodes):
         init_conf, final_conf, _ = random_configuration(args.num_agents)
         obs = env.reset(init_conf, final_conf)
@@ -54,6 +54,7 @@ def train(args):
             visualizer = StepVisualizer(env.ogm, output_path=gif_name)
             # visualizer.set_final_state(final_conf)
             visualizer.capture_state()
+            logging.info(f"Generating GIF for episode {ep+1}")
 
 
         # if visualizer:
@@ -78,25 +79,38 @@ def train(args):
                 if done or step >= args.max_steps:
                     break
 
+        # Capture final state after episode ends
+        if visualizer:
+            visualizer.capture_state()
+            logging.info(f"Captured {len(visualizer.frames)} frames for episode {ep+1}")
+
         metrics = agent.update()
         writer.add_scalar("reward/episode", episode_reward, ep)
 
         if metrics:
             for k, v in metrics.items():
                 writer.add_scalar(f"loss/{k}", v, ep)
-
+        
         if visualizer:
             visualizer.animate()
         
-        success = done if env.steps_taken < env.max_steps else False
-        success_count += int(success)
+        # Proper success detection to check if we actually reached the goal
+        actual_success = env.ogm.check_final() if hasattr(env, 'ogm') and env.ogm else False
+        success_count += int(actual_success)
         steps_per_episode.append(step)
+        
+        if visualizer:
+            if actual_success:
+                logging.info(f"Episode {ep+1} succeeded - final state captured")
+            else:
+                logging.info(f"Episode {ep+1} failed - final state captured")
+
         logging.info(
             "Episode %d finished after %d steps -- reward: %.3f : success = %s", 
             ep + 1, 
             step, 
             episode_reward,
-            success
+            actual_success
         )
 
     logging.info(

@@ -57,7 +57,7 @@ class RolloutBuffer:
         self.__init__()
 
 class MAPPOAgent(Agent):
-    def __init__(self, obs_dim, num_agents, action_dim = 48, lr=3e-4, gamma=0.99, 
+    def __init__(self, obs_dim, num_agents, action_dim = 49, lr=3e-4, gamma=0.99, 
                  lam=0.95, clip=0.2, epochs=4, batch_size=64, hidden_dim=128):
         self.num_agents = num_agents
         self.obs_dim = obs_dim + num_agents
@@ -125,9 +125,19 @@ class MAPPOAgent(Agent):
 
         advs = torch.tensor(advs, dtype=torch.float32)
         returns = torch.tensor(returns, dtype=torch.float32)
-        advs = (advs - advs.mean()) / (advs.std() + 1e-8)
+        
+        if len(advs) > 1:
+            advs = (advs - advs.mean()) / (advs.std() + 1e-8)
+        else:
+            advs = advs - advs.mean()  # Just center if only one sample
+            
+        # Check for NaN values and replace with zeros
+        advs = torch.where(torch.isnan(advs), torch.zeros_like(advs), advs)
+        returns = torch.where(torch.isnan(returns), torch.zeros_like(returns), returns)
+        
         masks = self.buffer.action_masks
         return states, agent_ids, returns, advs, masks
+
     
     def update(self):
         if len(self.buffer.states) == 0:
@@ -157,7 +167,14 @@ class MAPPOAgent(Agent):
                 logits = self.actor(inps)
                 mask = masks[batch]
                 logits = logits.masked_fill(~mask, -1e9)
+                
+                logits = torch.where(torch.isnan(logits), torch.full_like(logits, -1e9), logits)
+                
                 probs = F.softmax(logits, dim=-1)
+                
+                if torch.isnan(probs).any():
+                    probs = torch.ones_like(probs) / probs.shape[-1]
+                
                 dist = Categorical(probs)
                 log_probs = dist.log_prob(a)
                 entropy = dist.entropy().mean()
@@ -167,6 +184,10 @@ class MAPPOAgent(Agent):
                 actor_loss = -torch.min(surr1, surr2).mean()
 
                 values = self.critic(inps).squeeze()
+                
+                if values.dim() == 0:
+                    values = values.unsqueeze(0)
+                
                 critic_loss = F.mse_loss(values, returns[batch])
 
                 loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
