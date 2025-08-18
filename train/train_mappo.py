@@ -67,26 +67,63 @@ def train(args):
             random_queue = env.ogm.calc_queue()
             env.ogm.calc_pre_action_grid_map()
 
-            for aid in random_queue:#range(0, args.num_agents):
+            # Initialize temporary storage for experiences in this phase
+            phase_experiences = []
+            
+            # Get the number of agents that will move this phase
+            num_agents_in_phase = len(random_queue)
+
+            for i, aid in enumerate(random_queue):
                 aid = aid - 1
                 mask = env.ogm.calc_possible_actions()[aid + 1]
                 
-                # Store the current state before it gets overwritten 
                 current_obs = obs
                 
                 action, log_prob = agent.select_action(current_obs, aid, mask=mask)
-                # action, log_prob = agent.select_action(obs, aid)
-                obs, reward, done, _ = env.step((aid+1, action+1))
                 
-                # Pass the state that was used for the decision to the buffer
-                agent.store(current_obs, aid, action, log_prob, reward, done, mask)
+                # Determine if this is the first or last move
+                is_first = (i == 0)
+                is_last = (i == num_agents_in_phase - 1)
                 
-                episode_reward += reward
-                step+=1
+                # Call the modified step function
+                obs, reward, done, _ = env.step((aid+1, action+1), is_first_move_in_phase=is_first, is_final_move_in_phase=is_last)
+                
+                # Store the experience TEMPORARILY without the final reward yet
+                phase_experiences.append({
+                    "obs": current_obs, 
+                    "agent_id": aid, 
+                    "action": action, 
+                    "log_prob": log_prob, 
+                    "done": done, 
+                    "mask": mask
+                })
+                
+                episode_reward += reward # The final reward will be added on the last step
+                step += 1
+                
                 if visualizer:
                     visualizer.capture_state()
+                    
                 if done or step >= args.max_steps:
                     break
+
+            # The 'reward' variable now holds the collective reward from the last step
+            final_phase_reward = reward
+
+            # Now, store all experiences with the correct, shared reward
+            for exp in phase_experiences:
+                agent.store(
+                    exp["obs"], 
+                    exp["agent_id"], 
+                    exp["action"], 
+                    exp["log_prob"], 
+                    final_phase_reward,  # Use the final, collective reward for everyone
+                    exp["done"], 
+                    exp["mask"]
+                )
+
+            if done or step >= args.max_steps:
+                break # Break the outer while loop as well if the episode is over
 
         # Capture final state after episode ends
         if visualizer:
