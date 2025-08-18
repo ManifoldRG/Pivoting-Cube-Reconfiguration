@@ -18,14 +18,33 @@ class OGMEnv:
         self.steps_taken = 0
         return self.get_observation()
     
+    def get_rotation_invariant_distance(self):
+        """
+        Calculates the distance to the goal, accounting for all possible rotations.
+
+        It computes the Hamming distance between the current grid map and every
+        valid rotated version of the final grid map, returning the minimum
+        distance found. This ensures the agent is rewarded for building the
+        correct shape, regardless of its orientation.
+        """
+        if not hasattr(self.ogm, 'final_grid_maps') or len(self.ogm.final_grid_maps) == 0:
+            return np.sum(self.ogm.curr_grid_map != self.ogm.final_grid_map)
+
+        distances = [
+            np.sum(self.ogm.curr_grid_map != final_map) 
+            for final_map in self.ogm.final_grid_maps
+        ]
+        
+        return min(distances)
+    
     def step(self, action):
         if self.ogm is None:
             raise Exception("Environment not set. call reset function")
 
         module, pivot = action
 
-        # 1. Calculate distance before the move
-        initial_distance = np.sum(self.ogm.curr_grid_map != self.ogm.final_grid_map)
+        # 1. Calculate rotation-invariant distance before the move
+        initial_distance = self.get_rotation_invariant_distance()
 
         # Execute the action
         is_valid_action = self.ogm.calc_possible_actions()[module][pivot-1]
@@ -35,9 +54,9 @@ class OGMEnv:
         
         self.steps_taken += 1
 
-        # 2. Check for success and calculate new distance
+        # 2. Check for success and calculate new rotation-invariant distance
         done = self.ogm.check_final()
-        final_distance = np.sum(self.ogm.curr_grid_map != self.ogm.final_grid_map)
+        final_distance = self.get_rotation_invariant_distance()
 
         # 3. Calculate the hybrid reward
         potential_reward = initial_distance - final_distance 
