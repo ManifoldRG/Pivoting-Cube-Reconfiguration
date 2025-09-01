@@ -1,4 +1,5 @@
 import numpy as np
+from numpy.linalg import norm
 from collections import deque
 
 class OccupancyGridMap:
@@ -47,9 +48,10 @@ class OccupancyGridMap:
     self.modules = range(1, n+1)
     self.edges = self.calculate_edges(self.modules, self.module_positions)
     #self.pre_action_edges = self.edges.copy()
-    self.rotation_matrices()
     self.init_actions()
     self.calc_pre_action_grid_map()
+    self.final_pairwise_norms = self.calc_pairwise_norms(self.final_module_positions)
+    self.curr_pairwise_norms = self.calc_pairwise_norms(self.module_positions)
 
   def calculate_grid_size(self, n):
     """Calculate grid size based on number of modules.
@@ -133,6 +135,8 @@ class OccupancyGridMap:
       new_pos = (temp_mod[0] - offset[0], temp_mod[1] - offset[1], temp_mod[2] - offset[2])
       self.module_positions[module] = new_pos
       self.curr_grid_map[new_pos[0], new_pos[1], new_pos[2]] = module
+
+    self.curr_pairwise_norms = self.calc_pairwise_norms(self.module_positions)
 
 
   # probably need each module to track its own position so that they can be easily recentered
@@ -416,47 +420,20 @@ class OccupancyGridMap:
     self.pre_action_edges = self.edges.copy()
     self.pre_action_articulation_points = set(self.articulationPoints(len(self.modules), self.pre_action_edges))
 
+  # Calculate and return pairwise norms
+  def calc_pairwise_norms(self, mod_pos):
+    pairwise_norms = np.zeros((len(mod_pos), len(mod_pos)))
 
-  def rotation_matrices(self):
-    rx1 = np.array([[1, 0, 0], [0, np.cos(np.pi / 2), -np.sin(np.pi / 2)], [0, np.sin(np.pi / 2), np.cos(np.pi / 2)]])
-    rx2 = np.array([[1, 0, 0], [0, np.cos(np.pi), -np.sin(np.pi)], [0, np.sin(np.pi), np.cos(np.pi)]])
-    rx3 = np.array([[1, 0, 0], [0, np.cos(3 * np.pi / 2), -np.sin(3 * np.pi / 2)], [0, np.sin(3 * np.pi / 2), np.cos(3 * np.pi / 2)]])
-    ry1 = np.array([[np.cos(np.pi / 2), 0, np.sin(np.pi / 2)], [0, 1, 0], [-np.sin(np.pi / 2), 0, np.cos(np.pi / 2)]])
-    ry2 = np.array([[np.cos(np.pi), 0, np.sin(np.pi)], [0, 1, 0], [-np.sin(np.pi), 0, np.cos(np.pi)]])
-    ry3 = np.array([[np.cos(3 * np.pi / 2), 0, np.sin(3 * np.pi / 2)], [0, 1, 0], [-np.sin(3 * np.pi / 2), 0, np.cos(3 * np.pi / 2)]])
-    rz1 = np.array([[np.cos(np.pi / 2), -np.sin(np.pi / 2), 0], [np.sin(np.pi / 2), np.cos(np.pi / 2), 0], [0, 0, 1]])
-    rz2 = np.array([[np.cos(np.pi), -np.sin(np.pi), 0], [np.sin(np.pi), np.cos(np.pi), 0], [0, 0, 1]])
-    rz3 = np.array([[np.cos(3 * np.pi / 2), -np.sin(3 * np.pi / 2), 0], [np.sin(3 * np.pi / 2), np.cos(3 * np.pi / 2), 0], [0, 0, 1]])
+    for mod in mod_pos.keys():
 
-    self.rotmats = [rx1, rx2, rx3, ry1, ry2, ry3, rz1, rz2, rz3]
-    self.final_grid_maps = [self.final_grid_map]
+      for mod2 in mod_pos.keys():
 
-    for i in range(9):
-      temp_grid_map = np.zeros(self.curr_grid_map.shape)
-      rotmat = self.rotmats[i]
+        pairwise_norms[mod-1][mod2-1] = norm(np.array(mod_pos[mod2]) - np.array(mod_pos[mod]), 2)
 
-      for m in self.modules:
-        temp_pos = self.final_module_positions[m]
-        temp_pos = np.subtract(temp_pos, self.recenter_to)
-        new_pos = np.matmul(rotmat, temp_pos)
-        new_pos = np.rint(new_pos)
-        new_pos = new_pos.astype(int)
-        new_pos = np.add(new_pos, self.recenter_to)
-        #ipdb.set_trace()
-        # print(new_pos)
-        temp_grid_map[new_pos[0], new_pos[1], new_pos[2]] = m
-
-      self.final_grid_maps.append(temp_grid_map)
-    # print(f"Final grid maps: {self.final_grid_maps}")
+    return pairwise_norms
 
   def check_final(self):
-    #ipdb.set_trace()
-    for i in range(len(self.final_grid_maps)):
-      if np.all(self.curr_grid_map == self.final_grid_maps[i]):
-        return True
-    return False
-    #return np.all(self.curr_grid_map == self.final_grid_map)
-  # need to check relative positions of modules, maybe with a connectivity graph
+    return ((self.final_pairwise_norms - self.curr_pairwise_norms) + 1).all()
 
   # need to calculate edges first
   def calculate_edges(self, modules, module_positions):
