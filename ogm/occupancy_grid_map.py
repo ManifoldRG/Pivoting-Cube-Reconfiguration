@@ -432,8 +432,8 @@ class OccupancyGridMap:
 
     return pairwise_norms
 
-  def check_final(self):
-    return ((self.final_pairwise_norms - self.curr_pairwise_norms) + 1).all()
+  def check_final(self, tol=1e-6):
+    return np.allclose(self.final_pairwise_norms, self.curr_pairwise_norms, atol=tol)
 
   # need to calculate edges first
   def calculate_edges(self, modules, module_positions):

@@ -66,27 +66,25 @@ def train(args):
         while not done and step < args.max_steps:
             random_queue = env.ogm.calc_queue()
             env.ogm.calc_pre_action_grid_map()
+            phase_reward = 0.0
 
-            for aid in random_queue:#range(0, args.num_agents):
+            for aid in random_queue:
                 aid = aid - 1
                 mask = env.ogm.calc_possible_actions()[aid + 1]
-                
-                # Store the current state before it gets overwritten 
                 current_obs = obs
-                
                 action, log_prob = agent.select_action(current_obs, aid, mask=mask)
-                # action, log_prob = agent.select_action(obs, aid)
                 obs, reward, done, _ = env.step((aid+1, action+1))
-                
-                # Pass the state that was used for the decision to the buffer
                 agent.store(current_obs, aid, action, log_prob, reward, done, mask)
-                
-                episode_reward += reward
-                step+=1
-                if visualizer:
-                    visualizer.capture_state()
-                if done or step >= args.max_steps:
+                phase_reward = reward
+                if done or step >= args.max_steps: 
                     break
+
+            episode_reward += phase_reward
+            step += 1 
+            if visualizer:
+                visualizer.capture_state()
+            if done or step >= args.max_steps:
+                break
 
         # Capture final state after episode ends
         if visualizer:
