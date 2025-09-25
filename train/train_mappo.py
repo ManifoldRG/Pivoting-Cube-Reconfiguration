@@ -32,19 +32,24 @@ def train(args):
     writer = setup_logging(args.log_dir)
 
     init_conf, final_conf, grid_size = random_configuration(args.num_agents)
-    env = OGMEnv(step_cost=args.step_cost, max_steps=args.max_steps, 
-                 enable_bounty_reward=args.enable_bounty_reward, 
-                 bounty_gamma=args.bounty_gamma, bounty_eta=args.bounty_eta, bounty_base_value=args.bounty_base_value,
-                 enable_potential_reward=args.enable_potential_reward,
-                 potential_scale=args.potential_scale,
-                 potential_normalize=args.potential_normalize,
-                 success_bonus=args.success_bonus)
+    env = OGMEnv(
+        step_cost=args.step_cost,
+        max_steps=args.max_steps,
+        enable_bounty_reward=args.enable_bounty_reward,
+        bounty_gamma=args.bounty_gamma,
+        bounty_eta=args.bounty_eta,
+        bounty_base_value=args.bounty_base_value,
+        bounty_total_frac_of_success=args.bounty_total_frac_of_success,
+        bounty_cap_per_step=(None if args.bounty_cap_per_step == 0 else args.bounty_cap_per_step),
+        enable_potential_reward=args.enable_potential_reward,
+        potential_scale=args.potential_scale,
+        potential_normalize=args.potential_normalize,
+        success_bonus=args.success_bonus
+    )
     obs = env.reset(init_conf, final_conf)
     
-    # ---- NEW OBSERVATION DIM CALCULATION ----
     num_pairs = args.num_agents * (args.num_agents - 1) // 2
     obs_dim = num_pairs
-    # -----------------------------------------
     
     agent = MAPPOAgent(obs_dim, args.num_agents, action_dim=49, lr=args.lr, 
                        gamma=args.gamma, lam=args.lam, clip=args.clip, 
@@ -173,10 +178,15 @@ if __name__ == '__main__':
     parser.add_argument('--bounty_gamma', type=float, default=0.999)
     parser.add_argument('--bounty_eta', type=float, default=2.0)
     parser.add_argument('--bounty_base_value', type=float, default=1.0)
-    parser.add_argument('--enable_potential_reward', action='store_true', default=True)
+    parser.add_argument('--enable_potential_reward', action='store_true', default=False)
     parser.add_argument('--potential_scale', type=float, default=1.0)
     parser.add_argument('--potential_normalize', type=str, choices=['n2','max'], default='n2')
     parser.add_argument('--success_bonus', type=float, default=100.0)
     parser.add_argument('--step_cost', type=float, default=-0.01)
+    # Bounty config autoscaling and cap
+    parser.add_argument('--bounty_total_frac_of_success', type=float, default=0.2,
+                        help='Total bounty budget will be approx this fraction of success bonus')
+    parser.add_argument('--bounty_cap_per_step', type=float, default=20.0,
+                        help='Cap on total bounty paid in a single env step (0 disables)')
     args = parser.parse_args()
     train(args)
