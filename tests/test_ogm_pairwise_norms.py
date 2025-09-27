@@ -23,6 +23,14 @@ class TestOGMPairwiseNorms(unittest.TestCase):
             msg=f"\Current pairwise norms: {ogm.curr_pairwise_norms}\Final pairwise norms:   {ogm.final_pairwise_norms}"
         )
 
+    def assert_post_action_pairwise_norms(self, module_positions):
+        ogm = OccupancyGridMap(module_positions, module_positions, 3)
+        actions = ogm.calc_possible_actions()
+        pairwise_norms = ogm.calc_post_pairwise_norms()
+        self.assertTrue(
+            True
+        )
+
     def test_configuration_case_1(self):
 
         # Define initial module positions
@@ -41,6 +49,7 @@ class TestOGMPairwiseNorms(unittest.TestCase):
 
         self.assert_pairwise_norms_match(module_positions, np.array([[0.0, 1.0, 1.0], [1.0, 0.0, math.sqrt(2)], [1.0, math.sqrt(2), 0.0]]))
         self.assert_check_final(module_positions, final_module_positions)
+        self.assert_post_action_pairwise_norms(module_positions)
 
 if __name__ == "__main__":
     unittest.main()
