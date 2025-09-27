@@ -299,6 +299,133 @@ class OccupancyGridMap:
     #   print(np.where(self.possible_actions[m])[0] + 1)
 
     return self.possible_actions
+  
+  # For the pairwise norm-based actions, we want to calculate pairwise norms based on the results of the actions, an after-action grid map as the counter to the pre-action grid map. Or rather, a temporary grid map is returned after calculations are performed on the current grid map.
+  def calc_post_pairwise_norms(self):
+    self.post_action_pairwise_norms = {}
+
+    for module in self.modules:
+      module_position = self.module_positions[module]
+      actions = self.possible_actions[module]
+      self.post_action_pairwise_norms[module] = {}
+
+      for actindex in range(len(actions)):
+
+        if actions[actindex]:
+          action = actindex + 1
+        else:
+          continue
+
+        match action:
+          case 1:
+            new_module_position = (module_position[0] + 1, module_position[1], module_position[2])
+          case 2:
+            new_module_position = (module_position[0] + 1, module_position[1] - 1, module_position[2])
+          case 3:#
+            new_module_position = (module_position[0] + 1, module_position[1], module_position[2])
+          case 4:
+            new_module_position = (module_position[0] + 1, module_position[1] + 1, module_position[2])
+          case 5:
+            new_module_position = (module_position[0], module_position[1] + 1, module_position[2])
+          case 6:
+            new_module_position = (module_position[0] + 1, module_position[1] + 1, module_position[2])
+          case 7:
+            new_module_position = (module_position[0], module_position[1] - 1, module_position[2])
+          case 8:
+            new_module_position = (module_position[0] + 1, module_position[1] - 1, module_position[2])
+          case 9:
+            new_module_position = (module_position[0] - 1, module_position[1], module_position[2])
+          case 10:
+            new_module_position = (module_position[0] - 1, module_position[1] - 1, module_position[2])
+          case 11:
+            new_module_position = (module_position[0] - 1, module_position[1], module_position[2])
+          case 12:#
+            new_module_position = (module_position[0] - 1, module_position[1] + 1, module_position[2])
+          case 13:
+            new_module_position = (module_position[0], module_position[1] + 1, module_position[2])
+          case 14:
+            new_module_position = (module_position[0] - 1, module_position[1] + 1, module_position[2])
+          case 15:
+            new_module_position = (module_position[0], module_position[1] - 1, module_position[2])
+          case 16:#####################
+            new_module_position = (module_position[0] - 1, module_position[1] - 1, module_position[2])
+          case 17:
+            new_module_position = (module_position[0] + 1, module_position[1], module_position[2])
+          case 18:
+            new_module_position = (module_position[0] + 1, module_position[1], module_position[2] - 1) #fixed
+          case 19:#
+            new_module_position = (module_position[0] + 1, module_position[1], module_position[2])
+          case 20:
+            new_module_position = (module_position[0] + 1, module_position[1], module_position[2] + 1) #fixed
+          case 21:
+            new_module_position = (module_position[0], module_position[1], module_position[2] + 1) #fixed
+          case 22:
+            new_module_position = (module_position[0] + 1, module_position[1], module_position[2] + 1) #fixed
+          case 23:
+            new_module_position = (module_position[0], module_position[1], module_position[2] - 1) #fixed
+          case 24:
+            new_module_position = (module_position[0] + 1, module_position[1], module_position[2] - 1)
+          case 25:
+            new_module_position = (module_position[0] - 1, module_position[1], module_position[2])
+          case 26:
+            new_module_position = (module_position[0] - 1, module_position[1], module_position[2] - 1)
+          case 27:
+            new_module_position = (module_position[0] - 1, module_position[1], module_position[2])
+          case 28:#
+            new_module_position = (module_position[0] - 1, module_position[1], module_position[2] + 1)
+          case 29:
+            new_module_position = (module_position[0], module_position[1], module_position[2] + 1)
+          case 30:
+            new_module_position = (module_position[0] - 1, module_position[1], module_position[2] + 1)
+          case 31:
+            new_module_position = (module_position[0], module_position[1], module_position[2] - 1)
+          case 32:#####################
+            new_module_position = (module_position[0] - 1, module_position[1], module_position[2] - 1)
+          case 33:
+            new_module_position = (module_position[0], module_position[1] + 1, module_position[2])
+          case 34:
+            new_module_position = (module_position[0], module_position[1] + 1, module_position[2] - 1)
+          case 35:#
+            new_module_position = (module_position[0], module_position[1] + 1, module_position[2])
+          case 36:
+            new_module_position = (module_position[0], module_position[1] + 1, module_position[2] + 1)
+          case 37:
+            new_module_position = (module_position[0], module_position[1], module_position[2] + 1)
+          case 38:
+            new_module_position = (module_position[0], module_position[1] + 1, module_position[2] + 1) 
+          case 39:
+            new_module_position = (module_position[0], module_position[1], module_position[2] - 1)
+          case 40:
+            new_module_position = (module_position[0], module_position[1] + 1, module_position[2] - 1)
+          case 41:
+            new_module_position = (module_position[0], module_position[1] - 1, module_position[2])
+          case 42:
+            new_module_position = (module_position[0], module_position[1] - 1, module_position[2] - 1)
+          case 43:
+            new_module_position = (module_position[0], module_position[1] - 1, module_position[2])
+          case 44:#
+            new_module_position = (module_position[0], module_position[1] - 1, module_position[2] + 1)
+          case 45:
+            new_module_position = (module_position[0], module_position[1], module_position[2] + 1)
+          case 46:
+            new_module_position = (module_position[0], module_position[1] - 1, module_position[2] + 1)
+          case 47:
+            new_module_position = (module_position[0], module_position[1], module_position[2] - 1)
+          case 48:#####################
+            new_module_position = (module_position[0], module_position[1] - 1, module_position[2] - 1)
+          case 49:
+            new_module_position = self.module_positions[module]
+
+        #post_action_grid_map = np.empty_like(self.curr_grid_map)
+        #post_action_grid_map[:] = self.curr_grid_map
+        post_action_module_positions = self.module_positions.copy()
+        #post_action_grid_map[module_position[0], module_position[1], module_position[2]] = 0
+        #post_action_grid_map[new_module_position[0], new_module_position[1], new_module_position[2]] = module
+        post_action_module_positions[module] =new_module_position
+        self.post_action_pairwise_norms[module][action] = self.calc_pairwise_norms(post_action_module_positions)
+    return self.post_action_pairwise_norms
+      # we also need some way to map the pairwise norms to actions. Maybe just use the keys?
+
 
   def take_action(self, module, action):
     module_position = self.module_positions[module]
@@ -409,9 +536,6 @@ class OccupancyGridMap:
     self.module_positions[module] =new_module_position
     self.recenter()
     self.edges = self.calculate_edges(self.modules, self.module_positions)
-    
-    # print(f"Module Positions: {self.module_positions}")
-    #print(f"Curr Grid Map: {self.curr_grid_map}")
 
   # once all modules have taken their action during the action phase, we will reset the pre_action_grid_map to curr_grid_map
   def calc_pre_action_grid_map(self):
