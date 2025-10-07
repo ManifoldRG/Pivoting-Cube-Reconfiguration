@@ -559,6 +559,100 @@ class OccupancyGridMap:
   def check_final(self, tol=1e-6):
     return np.allclose(self.final_pairwise_norms, self.curr_pairwise_norms, atol=tol)
 
+  def compute_pairwise_sqdist(self, positions):
+    """Compute pairwise squared distances as integers.
+    
+    Args:
+        positions: Dictionary mapping module numbers to their positions (x,y,z)
+        
+    Returns:
+        n×n integer matrix of squared distances
+    """
+    n = len(positions)
+    D = np.zeros((n, n), dtype=np.int64)
+    
+    for i in range(n):
+        xi = positions[i + 1]  # modules are 1-indexed
+        for j in range(i + 1, n):
+            xj = positions[j + 1]  # modules are 1-indexed
+            dx = xi[0] - xj[0]
+            dy = xi[1] - xj[1]
+            dz = xi[2] - xj[2]
+            sqdist = dx*dx + dy*dy + dz*dz
+            D[i, j] = sqdist
+            D[j, i] = sqdist
+    
+    return D
+
+  def pair_index(self, i, j, n):
+    """Convert pair (i,j) to canonical index in upper triangular matrix.
+    
+    Args:
+        i, j: Module indices (0-indexed, i < j)
+        n: Total number of modules
+        
+    Returns:
+        Index in canonical pair ordering
+    """
+    if i >= j:
+        raise ValueError("i must be less than j")
+    return i * n - (i * (i + 1)) // 2 + (j - i - 1)
+
+  def generate_pair_bounties(self, D_final, base_value=1.0):
+    """Generate bounty structure for all pairs.
+    
+    Args:
+        D_final: Final squared distance matrix
+        base_value: Base bounty value for each pair
+        
+    Returns:
+        Tuple of (pairs_list, base_values_array)
+    """
+    n = D_final.shape[0]
+    pairs = []
+    base_values = []
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            pairs.append((i, j))
+            base_values.append(base_value)
+    
+    return pairs, np.array(base_values)
+
+  def get_pairwise_dist_vector(self, positions):
+    """
+    Computes the vech(D(sigma)) vector of pairwise distances.
+    Returns the upper triangular entries of the distance matrix (excluding diagonal).
+    """
+    n = len(self.modules)
+    if n < 2:
+        return np.array([])
+    
+    # The number of unique pairs is n * (n - 1) / 2
+    num_pairs = n * (n - 1) // 2
+    dist_vector = np.zeros(num_pairs)
+    
+    idx = 0
+    for i in range(1, n + 1):
+        for j in range(i + 1, n + 1):
+            pos_i = np.array(positions[i])
+            pos_j = np.array(positions[j])
+            dist_vector[idx] = np.linalg.norm(pos_i - pos_j)
+            idx += 1
+            
+    return dist_vector
+
+  def get_state_observation_vector(self):
+    """
+    Generates the full observation vector for the agent, containing
+    the difference between target and current pairwise distances.
+    """
+    current_dists = self.get_pairwise_dist_vector(self.module_positions)
+    target_dists = self.get_pairwise_dist_vector(self.final_module_positions)
+    
+    # The observation is the difference between target and current distances
+    return target_dists - current_dists
+
   # need to calculate edges first
   def calculate_edges(self, modules, module_positions):
     edges = []

@@ -60,8 +60,8 @@ class MAPPOAgent(Agent):
     def __init__(self, obs_dim, num_agents, action_dim = 49, lr=3e-4, gamma=0.99, 
                  lam=0.95, clip=0.2, epochs=4, batch_size=64, hidden_dim=128):
         self.num_agents = num_agents
-        # The observation now contains TWO maps, so we multiply the base obs_dim by 2.
-        self.obs_dim = (obs_dim * 2) + num_agents
+        # The observation is now the distance vector + one-hot agent ID
+        self.obs_dim = obs_dim + num_agents
         self.action_dim = action_dim
         self.gamma = gamma 
         self.lam = lam 
@@ -75,10 +75,10 @@ class MAPPOAgent(Agent):
         self.buffer = RolloutBuffer()
 
     def _process_obs(self, obs, agent_id):
-        obs_flat = torch.tensor(obs.ravel(), dtype=torch.float32)
+        obs_tensor = torch.tensor(obs, dtype=torch.float32)
         one_hot = torch.zeros(self.num_agents)
         one_hot[agent_id] = 1.0
-        return torch.cat([obs_flat, one_hot])
+        return torch.cat([obs_tensor, one_hot])
     
     def select_action(self, obs, agent_id, mask=None):
         with torch.no_grad():
@@ -95,7 +95,7 @@ class MAPPOAgent(Agent):
         return action.item(), log_prob.item()
     
     def store(self, obs, agent_id, action, log_prob, reward, done, mask):
-        self.buffer.states.append(obs.flatten())
+        self.buffer.states.append(obs)  # No longer need .flatten()
         self.buffer.agent_ids.append(agent_id)
         self.buffer.actions.append(action)
         self.buffer.log_probs.append(log_prob)
