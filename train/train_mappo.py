@@ -10,6 +10,7 @@ from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
 from visualizer.step_visualizer import StepVisualizer
 from visualizer import visualize_position
+from numpy.linalg import norm
 
 def setup_logging(log_dir):
     os.makedirs(log_dir, exist_ok=True)
@@ -32,14 +33,31 @@ def train(args):
     writer = setup_logging(args.log_dir)
 
     init_conf, final_conf, grid_size = random_configuration(args.num_agents)
-    env = OGMEnv(step_cost=-0.01, max_steps=args.max_steps)
+    env = OGMEnv(
+        step_cost=-0.01,
+        max_steps=args.max_steps,
+        enable_bounty_reward=args.enable_bounty_reward,
+        bounty_gamma=args.bounty_gamma,
+        bounty_eta=args.bounty_eta,
+        bounty_base_value=args.bounty_base_value,
+        bounty_total_frac_of_success=args.bounty_total_frac_of_success,
+        bounty_cap_per_step=args.bounty_cap_per_step,
+        enable_potential_reward=args.enable_potential_reward,
+        potential_scale=args.potential_scale,
+        potential_normalize=args.potential_normalize,
+        success_bonus=args.success_bonus,
+    )
     obs = env.reset(init_conf, final_conf)
     
-    obs_dim = grid_size ** 3
+    # Observation is two stacked (n x n) pairwise norms matrices; agent ctor multiplies by 2
+    obs_dim = args.num_agents ** 2
     
-    agent = MAPPOAgent(obs_dim, args.num_agents, action_dim=49, lr=args.lr, 
-                       gamma=args.gamma, lam=args.lam, clip=args.clip, 
-                       epochs=args.epochs, batch_size=args.batch_size)
+    agent = MAPPOAgent(
+        obs_dim, args.num_agents, action_dim=49, lr=args.lr,
+        gamma=args.gamma, lam=args.lam, clip=args.clip,
+        epochs=args.epochs, batch_size=args.batch_size,
+        hidden_dim=args.hidden_dim, entropy_coef=args.entropy_coef, grad_clip=args.grad_clip
+    )
     success_count = 0
     steps_per_episode = []
     
@@ -64,26 +82,38 @@ def train(args):
 
 
         while not done and step < args.max_steps:
-            random_queue = env.ogm.calc_queue()
             env.ogm.calc_pre_action_grid_map()
             phase_reward = 0.0
 
-            for aid in random_queue:
-                aid = aid - 1
+            # Sequential agent actions: 1..num_agents
+            for aid in range(args.num_agents):
                 moves = env.ogm.calc_possible_actions()
                 mask = moves[aid + 1]
                 current_obs = obs
                 action, log_prob = agent.select_action(current_obs, aid, mask=mask)
+                # Precompute and log the post-action pairwise norms for the chosen action
+                post_norms = env.ogm.calc_post_pairwise_norms()
+                chosen_matrix = None
+                if (aid + 1) in post_norms and (action + 1) in post_norms[aid + 1]:
+                    chosen_matrix = post_norms[aid + 1][action + 1]
+                    # Normalize for logging consistency
+                    grid_size = env.ogm.curr_grid_map.shape[0]
+                    max_dist = max(np.sqrt(3) * (grid_size - 1), 1.0)
+                    chosen_matrix_norm = chosen_matrix / max_dist
+                    # Log Frobenius distance to goal
+                    frob_to_goal = np.linalg.norm((env.ogm.final_pairwise_norms / max_dist) - chosen_matrix_norm, 'fro')
+                    writer.add_scalar("debug/frob_to_goal", frob_to_goal, step)
+
                 obs, reward, done, _ = env.step((aid+1, action+1))
                 agent.store(current_obs, aid, action, log_prob, reward, done, mask)
                 phase_reward = reward
-                if done or step >= args.max_steps: 
+                step += 1
+                if visualizer:
+                    visualizer.capture_state()
+                if done or step >= args.max_steps:
                     break
 
             episode_reward += phase_reward
-            step += 1 
-            if visualizer:
-                visualizer.capture_state()
             if done or step >= args.max_steps:
                 break
 
@@ -141,7 +171,21 @@ if __name__ == '__main__':
     parser.add_argument('--clip', type=float, default=0.2)
     parser.add_argument('--epochs', type=int, default=4)
     parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--hidden_dim', type=int, default=256)
+    parser.add_argument('--entropy_coef', type=float, default=0.02)
+    parser.add_argument('--grad_clip', type=float, default=0.0)
     parser.add_argument('--log_dir', type=str, default='runs', help='Directory for logs and TensorBoard')
     parser.add_argument('--gif_interval', type=int, default=0, help='Save an episode GIF every N episodes (0 disables)')
+    # Reward config CLI switches
+    parser.add_argument('--enable_bounty_reward', action='store_true')
+    parser.add_argument('--bounty_gamma', type=float, default=0.999)
+    parser.add_argument('--bounty_eta', type=float, default=2.0)
+    parser.add_argument('--bounty_base_value', type=float, default=1.0)
+    parser.add_argument('--bounty_total_frac_of_success', type=float, default=0.2)
+    parser.add_argument('--bounty_cap_per_step', type=float, default=20.0)
+    parser.add_argument('--enable_potential_reward', action='store_true', default=True)
+    parser.add_argument('--potential_scale', type=float, default=1.0)
+    parser.add_argument('--potential_normalize', type=str, default='n2', choices=['n2','none'])
+    parser.add_argument('--success_bonus', type=float, default=100.0)
     args = parser.parse_args()
     train(args)

@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from agent.base_agent import Agent
 
 class Actor(nn.Module):
-    def __init__(self, input_dim, action_dim, hidden_dim=128):
+    def __init__(self, input_dim, action_dim, hidden_dim=256):
         super().__init__()
         logging.debug(
             "Actor initialized with input_dim=%d hidden_dim=%d action_dim=%d",
@@ -29,7 +29,7 @@ class Actor(nn.Module):
         return self.net(x)
     
 class Critic(nn.Module):
-    def __init__(self, input_dim, hidden_dim=128):
+    def __init__(self, input_dim, hidden_dim=256):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -58,7 +58,8 @@ class RolloutBuffer:
 
 class MAPPOAgent(Agent):
     def __init__(self, obs_dim, num_agents, action_dim = 49, lr=3e-4, gamma=0.99, 
-                 lam=0.95, clip=0.2, epochs=4, batch_size=64, hidden_dim=128):
+                 lam=0.95, clip=0.2, epochs=4, batch_size=64, hidden_dim=256,
+                 entropy_coef=0.02, grad_clip=None):
         self.num_agents = num_agents
         # The observation now contains TWO maps, so we multiply the base obs_dim by 2.
         self.obs_dim = (obs_dim * 2) + num_agents
@@ -68,6 +69,8 @@ class MAPPOAgent(Agent):
         self.clip = clip 
         self.epochs = epochs
         self.batch_size = batch_size
+        self.entropy_coef = entropy_coef
+        self.grad_clip = grad_clip
 
         self.actor = Actor(self.obs_dim, action_dim, hidden_dim)
         self.critic = Critic(self.obs_dim, hidden_dim)
@@ -191,10 +194,15 @@ class MAPPOAgent(Agent):
                 
                 critic_loss = F.mse_loss(values, returns[batch])
 
-                loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
+                loss = actor_loss + 0.5 * critic_loss - self.entropy_coef * entropy
 
                 self.optimizer.zero_grad()
                 loss.backward()
+                if self.grad_clip is not None and self.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        list(self.actor.parameters()) + list(self.critic.parameters()),
+                        self.grad_clip
+                    )
                 self.optimizer.step()
 
                 total_actor_loss += actor_loss.item()

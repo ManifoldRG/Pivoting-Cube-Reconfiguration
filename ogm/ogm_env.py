@@ -7,7 +7,12 @@ from ogm.occupancy_grid_map import OccupancyGridMap
 Environment wrapper for OGM
 """
 class OGMEnv:
-    def __init__(self, step_cost = -0.01, max_steps = None):
+    def __init__(self, step_cost = -0.005, max_steps = None,
+                 enable_bounty_reward = False, bounty_gamma = 0.999, bounty_eta = 2.0,
+                 bounty_base_value = 1.0, bounty_total_frac_of_success = 0.2,
+                 bounty_cap_per_step = 20.0, enable_potential_reward = True,
+                 potential_scale = 1.0, potential_normalize = 'n2', success_bonus = 100.0):
+        # General
         self.step_cost = step_cost
         self.max_steps = max_steps 
         self.steps_taken = 0
@@ -16,6 +21,19 @@ class OGMEnv:
         self.action_count = 0 
         self.num_modules = None
         self.initial_norm_diff = None 
+        # Reward config
+        self.enable_bounty_reward = enable_bounty_reward
+        self.bounty_params = {
+            'gamma': bounty_gamma,
+            'eta': bounty_eta,
+            'base_value': bounty_base_value,
+        }
+        self.bounty_total_frac_of_success = bounty_total_frac_of_success
+        self.bounty_cap_per_step = bounty_cap_per_step
+        self.enable_potential_reward = enable_potential_reward
+        self.potential_scale = potential_scale
+        self.potential_normalize = potential_normalize
+        self.success_bonus = success_bonus
 
     def reset(self, initial_config, final_config):
         self.ogm = OccupancyGridMap(initial_config, final_config, len(initial_config))
@@ -40,11 +58,8 @@ class OGMEnv:
         observation = self.get_observation()
         info = {'step': self.steps_taken}
 
-        # Return 0 reward if not all modules have acted
-        if self.action_count < self.num_modules:
-            self.ogm.take_action(action[0], action[1])
-            # We need to actually take the actions here so that the current grid map is updated; at the end we'll update the pre-action grid map
-            return observation, reward, done, info
+        # Execute action immediately (sequential execution)
+        self.ogm.take_action(action[0], action[1])
 
         self.steps_taken += 1
         invalid_move = False
@@ -69,12 +84,23 @@ class OGMEnv:
         )
 
         # Calculate reward
-        # the Frobenius norm scales with n^2 (for n modules). This could result in large reward values for large n
-        # so normalizing the norm difference by n^2 keeps rewards in a reasonable range
-        potential_reward = (self.initial_norm_diff - final_norm_diff) / (self.num_modules ** 2)
-        success_bonus = 100.0 if self.ogm.check_final() else 0.0
+        # Potential-based term (optionally enabled)
+        if self.enable_potential_reward:
+            if self.potential_normalize == 'n2':
+                norm_factor = (self.num_modules ** 2)
+            else:
+                norm_factor = 1.0
+            potential_reward = ((self.initial_norm_diff - final_norm_diff) / norm_factor) * self.potential_scale
+        else:
+            potential_reward = 0.0
+
+        success_bonus = self.success_bonus if self.ogm.check_final() else 0.0
+        bounty_reward = 0.0
+        if self.enable_bounty_reward:
+            # Placeholder for bounty reward (not yet implemented here)
+            bounty_reward = 0.0
         invalid_move_penalty = -1.0 if invalid_move else 0.0
-        reward = potential_reward + success_bonus + invalid_move_penalty + self.step_cost
+        reward = potential_reward + success_bonus + invalid_move_penalty + bounty_reward + self.step_cost
 
         self.initial_norm_diff = final_norm_diff
 
@@ -84,16 +110,24 @@ class OGMEnv:
         self.action_count = 0
 
         observation = self.get_observation()
-        info = {'step': self.steps_taken}
+        info = {'step': self.steps_taken, 'bounty_reward': bounty_reward, 'potential_reward': potential_reward}
         return observation, reward, done, info
     
     def get_observation(self):
         """
-        Stacks the current and final grid maps to create a 2-channel observation.
-        This allows the agent to see both its current state and its goal state.
+        Stacks the current and final pairwise norms to create a 2-channel observation.
+        This allows the agent to see both its current shape and its goal shape.
         """
         if self.ogm is None:
             raise Exception("Environment not set. call reset function")
         
-        # Shape becomes (2, grid_size, grid_size, grid_size)
-        return np.stack([self.ogm.curr_grid_map, self.ogm.final_grid_map], axis=0)
+        # Normalize by maximum possible grid distance for scale stability
+        grid_size = self.ogm.curr_grid_map.shape[0]
+        max_dist = np.sqrt(3) * (grid_size - 1)
+        max_dist = max(max_dist, 1.0)
+
+        curr = self.ogm.curr_pairwise_norms / max_dist
+        final = self.ogm.final_pairwise_norms / max_dist
+
+        # Shape becomes (2, num_modules, num_modules)
+        return np.stack([curr, final], axis=0)
