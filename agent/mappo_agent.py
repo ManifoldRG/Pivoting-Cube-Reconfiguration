@@ -8,13 +8,13 @@ import torch.nn.functional as F
 from agent.base_agent import Agent
 
 class Actor(nn.Module):
-    def __init__(self, input_dim, action_dim, hidden_dim=256):
+    def __init__(self, input_dim, output_dim, hidden_dim=256):
         super().__init__()
         logging.debug(
-            "Actor initialized with input_dim=%d hidden_dim=%d action_dim=%d",
+            "Actor initialized with input_dim=%d hidden_dim=%d output_dim=%d",
             input_dim,
             hidden_dim,
-            action_dim
+            output_dim
         )
         # print(input_dim, hidden_dim, action_dim)
         self.net = nn.Sequential(
@@ -22,7 +22,7 @@ class Actor(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim)
+            nn.Linear(hidden_dim, output_dim)
         )
 
     def forward(self, x):
@@ -52,6 +52,7 @@ class RolloutBuffer:
         self.dones = []
         self.agent_ids = []
         self.action_masks = []
+        self.candidates = []
 
     def clear(self):
         self.__init__()
@@ -59,7 +60,8 @@ class RolloutBuffer:
 class MAPPOAgent(Agent):
     def __init__(self, obs_dim, num_agents, action_dim = 49, lr=3e-4, gamma=0.99, 
                  lam=0.95, clip=0.2, epochs=4, batch_size=64, hidden_dim=256,
-                 entropy_coef=0.02, grad_clip=None):
+                 entropy_coef=0.02, grad_clip=None, distance_temperature=10.0,
+                 aux_coef=0.1):
         self.num_agents = num_agents
         # The observation now contains TWO maps, so we multiply the base obs_dim by 2.
         self.obs_dim = (obs_dim * 2) + num_agents
@@ -71,8 +73,12 @@ class MAPPOAgent(Agent):
         self.batch_size = batch_size
         self.entropy_coef = entropy_coef
         self.grad_clip = grad_clip
+        self.distance_temperature = distance_temperature
+        self.aux_coef = aux_coef
 
-        self.actor = Actor(self.obs_dim, action_dim, hidden_dim)
+        # Actor outputs target vector representing desired pairwise norms (flattened)
+        self.target_dim = obs_dim
+        self.actor = Actor(self.obs_dim, self.target_dim, hidden_dim)
         self.critic = Critic(self.obs_dim, hidden_dim)
         self.optimizer = optim.Adam(list(self.actor.parameters()) + list(self.critic.parameters()), lr=lr)
         self.buffer = RolloutBuffer()
@@ -83,13 +89,16 @@ class MAPPOAgent(Agent):
         one_hot[agent_id] = 1.0
         return torch.cat([obs_flat, one_hot])
     
-    def select_action(self, obs, agent_id, mask=None):
+    def select_action(self, obs, agent_id, candidates_flat, mask=None):
         with torch.no_grad():
             x = self._process_obs(obs, agent_id)
-            logits = self.actor(x)
-            if mask is not None:
-                m = torch.tensor(mask, dtype=torch.bool)
-                logits = logits.masked_fill(~m, -1e9)
+            target_vec = self.actor(x)
+            C = torch.tensor(candidates_flat, dtype=torch.float32)
+            m = torch.tensor(mask, dtype=torch.bool) if mask is not None else torch.ones(C.shape[0], dtype=torch.bool)
+            diffs = C - target_vec
+            dists = torch.sqrt(torch.clamp(torch.sum(diffs * diffs, dim=1), min=1e-12))
+            logits = -self.distance_temperature * dists
+            logits = logits.masked_fill(~m, -1e9)
             probs = F.softmax(logits, dim=-1)
             dist = Categorical(probs)
             action = dist.sample()
@@ -97,7 +106,7 @@ class MAPPOAgent(Agent):
 
         return action.item(), log_prob.item()
     
-    def store(self, obs, agent_id, action, log_prob, reward, done, mask):
+    def store(self, obs, agent_id, action, log_prob, reward, done, mask, candidates_flat):
         self.buffer.states.append(obs.flatten())
         self.buffer.agent_ids.append(agent_id)
         self.buffer.actions.append(action)
@@ -105,6 +114,7 @@ class MAPPOAgent(Agent):
         self.buffer.rewards.append(reward)
         self.buffer.dones.append(done)
         self.buffer.action_masks.append(mask)
+        self.buffer.candidates.append(candidates_flat)
     
     def _compute_returns_adv(self):
         rewards = self.buffer.rewards
@@ -151,6 +161,7 @@ class MAPPOAgent(Agent):
         actions = torch.tensor(self.buffer.actions, dtype=torch.long)
         old_log_probs = torch.tensor(self.buffer.log_probs, dtype=torch.float32)
         masks = torch.tensor(np.array(masks), dtype=torch.bool)
+        candidates = torch.tensor(np.array(self.buffer.candidates), dtype=torch.float32)
         dataset_size = len(actions)
 
 
@@ -168,12 +179,15 @@ class MAPPOAgent(Agent):
                 a = actions[batch]
                 old_lp = old_log_probs[batch]
                 inps = torch.cat([s, F.one_hot(ids, self.num_agents).float()], dim=1)
-                logits = self.actor(inps)
-                mask = masks[batch]
+                target_vecs = self.actor(inps)                 # (B, D)
+                C = candidates[batch]                          # (B, 49, D)
+                mask = masks[batch]                            # (B, 49)
+                diffs = C - target_vecs.unsqueeze(1)           # (B, 49, D)
+                dists = torch.sqrt(torch.clamp(torch.sum(diffs * diffs, dim=2), min=1e-12))
+                logits = -self.distance_temperature * dists    # (B, 49)
                 logits = logits.masked_fill(~mask, -1e9)
-                
+
                 logits = torch.where(torch.isnan(logits), torch.full_like(logits, -1e9), logits)
-                
                 probs = F.softmax(logits, dim=-1)
                 
                 if torch.isnan(probs).any():
@@ -194,7 +208,11 @@ class MAPPOAgent(Agent):
                 
                 critic_loss = F.mse_loss(values, returns[batch])
 
-                loss = actor_loss + 0.5 * critic_loss - self.entropy_coef * entropy
+                # Auxiliary regression: pull target_vecs toward chosen candidate vectors
+                chosen_candidates = C[torch.arange(C.shape[0]), a]  # (B, D)
+                aux_loss = F.mse_loss(target_vecs, chosen_candidates)
+
+                loss = actor_loss + 0.5 * critic_loss + self.aux_coef * aux_loss - self.entropy_coef * entropy
 
                 self.optimizer.zero_grad()
                 loss.backward()

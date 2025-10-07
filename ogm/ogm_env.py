@@ -44,6 +44,25 @@ class OGMEnv:
         self.initial_norm_diff = np.linalg.norm(
             self.ogm.final_pairwise_norms - self.ogm.curr_pairwise_norms, 'fro'
         )
+        # Initialize bounty/potential state
+        if self.enable_bounty_reward or self.enable_potential_reward:
+            self.final_sqdist = self.ogm.compute_pairwise_sqdist(self.ogm.final_module_positions)
+            self.curr_sqdist = self.ogm.compute_pairwise_sqdist(self.ogm.module_positions)
+        if self.enable_bounty_reward:
+            self.pairs, self.bounty_base_values = self.ogm.generate_pair_bounties(
+                self.final_sqdist, base_value=self.bounty_params['base_value']
+            )
+            # scale to fraction of success bonus
+            desired_total = float(self.bounty_total_frac_of_success) * float(self.success_bonus)
+            current_sum = float(np.sum(self.bounty_base_values)) if len(self.bounty_base_values) else 0.0
+            if current_sum > 0.0:
+                scale = desired_total / current_sum
+                self.bounty_base_values = np.array(self.bounty_base_values, dtype=float) * float(scale)
+            self.bounty_available = np.ones(len(self.pairs), dtype=bool)
+            for idx, (i, j) in enumerate(self.pairs):
+                if self.curr_sqdist[i, j] == self.final_sqdist[i, j]:
+                    self.bounty_available[idx] = False
+            self.R0 = int(self.bounty_available.sum())
         return self.get_observation()
     
     def step(self, action):
@@ -97,8 +116,22 @@ class OGMEnv:
         success_bonus = self.success_bonus if self.ogm.check_final() else 0.0
         bounty_reward = 0.0
         if self.enable_bounty_reward:
-            # Placeholder for bounty reward (not yet implemented here)
-            bounty_reward = 0.0
+            # Update sqdist and pay new matches
+            self.curr_sqdist = self.ogm.compute_pairwise_sqdist(self.ogm.module_positions)
+            newly_matched_idx = []
+            for idx, (i, j) in enumerate(self.pairs):
+                if self.bounty_available[idx] and self.curr_sqdist[i, j] == self.final_sqdist[i, j]:
+                    newly_matched_idx.append(idx)
+            R_before = int(self.bounty_available.sum()) if self.bounty_available is not None else 0
+            multiplier = 1.0 + self.bounty_params['eta'] * (R_before / self.R0) if getattr(self, 'R0', 0) and R_before > 0 else 1.0
+            bounty_reward_raw = 0.0
+            for idx in newly_matched_idx:
+                b0 = self.bounty_base_values[idx]
+                decay = self.bounty_params['gamma'] ** self.steps_taken
+                bounty_reward_raw += b0 * decay * multiplier
+                self.bounty_available[idx] = False
+            cap = getattr(self, 'bounty_cap_per_step', None)
+            bounty_reward = float(min(bounty_reward_raw, cap)) if cap is not None else float(bounty_reward_raw)
         invalid_move_penalty = -1.0 if invalid_move else 0.0
         reward = potential_reward + success_bonus + invalid_move_penalty + bounty_reward + self.step_cost
 

@@ -56,7 +56,8 @@ def train(args):
         obs_dim, args.num_agents, action_dim=49, lr=args.lr,
         gamma=args.gamma, lam=args.lam, clip=args.clip,
         epochs=args.epochs, batch_size=args.batch_size,
-        hidden_dim=args.hidden_dim, entropy_coef=args.entropy_coef, grad_clip=args.grad_clip
+        hidden_dim=args.hidden_dim, entropy_coef=args.entropy_coef, grad_clip=args.grad_clip,
+        distance_temperature=args.distance_temperature, aux_coef=args.aux_coef
     )
     success_count = 0
     steps_per_episode = []
@@ -90,22 +91,29 @@ def train(args):
                 moves = env.ogm.calc_possible_actions()
                 mask = moves[aid + 1]
                 current_obs = obs
-                action, log_prob = agent.select_action(current_obs, aid, mask=mask)
-                # Precompute and log the post-action pairwise norms for the chosen action
+                # Build candidate post-action pairwise norms (normalized) flattened
                 post_norms = env.ogm.calc_post_pairwise_norms()
-                chosen_matrix = None
-                if (aid + 1) in post_norms and (action + 1) in post_norms[aid + 1]:
-                    chosen_matrix = post_norms[aid + 1][action + 1]
-                    # Normalize for logging consistency
-                    grid_size = env.ogm.curr_grid_map.shape[0]
-                    max_dist = max(np.sqrt(3) * (grid_size - 1), 1.0)
-                    chosen_matrix_norm = chosen_matrix / max_dist
-                    # Log Frobenius distance to goal
-                    frob_to_goal = np.linalg.norm((env.ogm.final_pairwise_norms / max_dist) - chosen_matrix_norm, 'fro')
-                    writer.add_scalar("debug/frob_to_goal", frob_to_goal, step)
+                grid_size = env.ogm.curr_grid_map.shape[0]
+                max_dist = max(np.sqrt(3) * (grid_size - 1), 1.0)
+                candidates_flat = []
+                for act_id in range(1, 50):
+                    if (aid + 1) in post_norms and act_id in post_norms[aid + 1]:
+                        mat = post_norms[aid + 1][act_id] / max_dist
+                        candidates_flat.append(mat.flatten())
+                    else:
+                        # placeholder; will be masked out
+                        candidates_flat.append(np.zeros((args.num_agents, args.num_agents)).flatten())
+                candidates_flat = np.array(candidates_flat, dtype=np.float32)
+
+                action, log_prob = agent.select_action(current_obs, aid, candidates_flat, mask=mask)
+
+                # Log Frobenius distance of chosen candidate to goal
+                chosen_matrix_norm = candidates_flat[action].reshape(args.num_agents, args.num_agents)
+                frob_to_goal = np.linalg.norm((env.ogm.final_pairwise_norms / max_dist) - chosen_matrix_norm, 'fro')
+                writer.add_scalar("debug/frob_to_goal", frob_to_goal, step)
 
                 obs, reward, done, _ = env.step((aid+1, action+1))
-                agent.store(current_obs, aid, action, log_prob, reward, done, mask)
+                agent.store(current_obs, aid, action, log_prob, reward, done, mask, candidates_flat)
                 phase_reward = reward
                 step += 1
                 if visualizer:
@@ -174,6 +182,8 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_dim', type=int, default=256)
     parser.add_argument('--entropy_coef', type=float, default=0.02)
     parser.add_argument('--grad_clip', type=float, default=0.0)
+    parser.add_argument('--distance_temperature', type=float, default=10.0)
+    parser.add_argument('--aux_coef', type=float, default=0.1)
     parser.add_argument('--log_dir', type=str, default='runs', help='Directory for logs and TensorBoard')
     parser.add_argument('--gif_interval', type=int, default=0, help='Save an episode GIF every N episodes (0 disables)')
     # Reward config CLI switches
