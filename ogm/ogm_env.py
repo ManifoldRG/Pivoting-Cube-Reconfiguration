@@ -1,5 +1,6 @@
 # import gymnasium as gym
 # from gymnasium import spaces
+import math
 import numpy as np
 from ogm.occupancy_grid_map import OccupancyGridMap
 
@@ -11,7 +12,8 @@ class OGMEnv:
                  enable_bounty_reward = False, bounty_gamma = 0.999, bounty_eta = 2.0,
                  bounty_base_value = 1.0, bounty_total_frac_of_success = 0.2,
                  bounty_cap_per_step = 20.0, enable_potential_reward = True,
-                 potential_scale = 1.0, potential_normalize = 'n2', success_bonus = 100.0):
+                 potential_scale = 1.0, potential_normalize = 'n2', success_bonus = 100.0,
+                 step_cost_initial = -0.01, step_cost_min = -0.001, use_exponential_decay = True):
         # General
         self.step_cost = step_cost
         self.max_steps = max_steps 
@@ -20,7 +22,13 @@ class OGMEnv:
         self.action_buffer = [] 
         self.action_count = 0 
         self.num_modules = None
-        self.initial_norm_diff = None 
+        self.initial_norm_diff = None
+        
+        # Exponential decay parameters
+        self.step_cost_initial = step_cost_initial
+        self.step_cost_min = step_cost_min
+        self.use_exponential_decay = use_exponential_decay
+        self.decay_rate = None 
         # Reward config
         self.enable_bounty_reward = enable_bounty_reward
         self.bounty_params = {
@@ -44,6 +52,12 @@ class OGMEnv:
         self.initial_norm_diff = np.linalg.norm(
             self.ogm.final_pairwise_norms - self.ogm.curr_pairwise_norms, 'fro'
         )
+        
+        # Calculate decay rate for exponential step cost
+        if self.use_exponential_decay and self.max_steps is not None:
+            self.decay_rate = -math.log(self.step_cost_min / self.step_cost_initial) / self.max_steps
+        else:
+            self.decay_rate = None
         # Initialize bounty/potential state
         if self.enable_bounty_reward or self.enable_potential_reward:
             self.final_sqdist = self.ogm.compute_pairwise_sqdist(self.ogm.final_module_positions)
@@ -133,7 +147,17 @@ class OGMEnv:
             cap = getattr(self, 'bounty_cap_per_step', None)
             bounty_reward = float(min(bounty_reward_raw, cap)) if cap is not None else float(bounty_reward_raw)
         invalid_move_penalty = -1.0 if invalid_move else 0.0
-        reward = potential_reward + success_bonus + invalid_move_penalty + bounty_reward + self.step_cost
+        
+        # Calculate step cost (exponential decay or flat)
+        if self.use_exponential_decay and self.decay_rate is not None:
+            current_step_cost = max(
+                self.step_cost_initial * math.exp(-self.decay_rate * self.steps_taken),
+                self.step_cost_min
+            )
+        else:
+            current_step_cost = self.step_cost
+            
+        reward = potential_reward + success_bonus + invalid_move_penalty + bounty_reward + current_step_cost
 
         self.initial_norm_diff = final_norm_diff
 

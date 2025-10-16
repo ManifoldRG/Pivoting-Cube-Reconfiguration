@@ -46,6 +46,9 @@ def train(args):
         potential_scale=args.potential_scale,
         potential_normalize=args.potential_normalize,
         success_bonus=args.success_bonus,
+        step_cost_initial=args.step_cost_initial,
+        step_cost_min=args.step_cost_min,
+        use_exponential_decay=args.use_exponential_decay,
     )
     obs = env.reset(init_conf, final_conf)
     
@@ -179,7 +182,7 @@ if __name__ == '__main__':
     parser.add_argument('--clip', type=float, default=0.2)
     parser.add_argument('--epochs', type=int, default=4)
     parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--hidden_dim', type=int, default=256)
+    parser.add_argument('--hidden_dim', type=int, default=768)
     parser.add_argument('--entropy_coef', type=float, default=0.02)
     parser.add_argument('--grad_clip', type=float, default=0.0)
     parser.add_argument('--distance_temperature', type=float, default=10.0)
@@ -197,5 +200,9 @@ if __name__ == '__main__':
     parser.add_argument('--potential_scale', type=float, default=1.0)
     parser.add_argument('--potential_normalize', type=str, default='n2', choices=['n2','none'])
     parser.add_argument('--success_bonus', type=float, default=100.0)
+    # Exponential decay step cost parameters
+    parser.add_argument('--step_cost_initial', type=float, default=-0.01)
+    parser.add_argument('--step_cost_min', type=float, default=-0.001)
+    parser.add_argument('--use_exponential_decay', action='store_true', default=True)
     args = parser.parse_args()
     train(args)
