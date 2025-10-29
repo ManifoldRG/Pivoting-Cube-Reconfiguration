@@ -29,6 +29,7 @@ class OccupancyGridMap:
     self.curr_grid_map = np.zeros((grid_size, grid_size, grid_size))
     self.pre_action_grid_map = np.zeros((grid_size, grid_size, grid_size)) # this will store the grid map as it is before the action step begins
     self.final_grid_map = np.zeros((grid_size, grid_size, grid_size))
+    self.pivot_zone_grid_map = np.full((grid_size, grid_size, grid_size), True)
     
     # Recenter module positions so that module 1 is at the center of the grid
     self.module_positions, self.final_module_positions = self.recenter_initial_positions(
@@ -125,7 +126,6 @@ class OccupancyGridMap:
   # recenter the grid_map so that a module (the first one for now) is at (0,0,0)
   def recenter(self):
     # recenter to a position (NOT the origin)
-    #ipdb.set_trace()
     curr_pos = self.module_positions[1]
     offset = (curr_pos[0] - self.recenter_to[0], curr_pos[1] - self.recenter_to[1], curr_pos[2] - self.recenter_to[2])
     self.curr_grid_map = np.zeros(self.curr_grid_map.shape)
@@ -193,6 +193,56 @@ class OccupancyGridMap:
                              47: np.array([[True, True], [False, True], [False, False]]), #fixed
                              48: np.array([[False, False, True], [False, False, True], [False, False, False]]) #fixed
                              }
+    # true or false to represent no-pivot zones? False for consistency; True will represent free zones
+    self.free_zones = {1: np.array([[True, False, False], [True, False, False]]),
+                      2: np.array([[True, False, False], [False, False, False], [False, False, False]]),
+                      3: np.array([[False, False, True], [False, False, True]]),
+                      4: np.array([[False, False, True], [False, False, False], [False, False, False]]),
+                      5: np.array([[False, False], [False, False], [True, True]]),
+                      6: np.array([[False, False, False], [False, False, False], [True, False, False]]),
+                      7: np.array([[False, False], [False, False], [True, True]]),
+                      8: np.array([[False, False, False], [False, False, False], [False, False, True]]),
+                      9: np.array([[True, False, False], [True, False, False]]),
+                      10: np.array([[False, False, False], [False, False, False], [True, False, False]]),
+                      11: np.array([[False, False, True], [False, False, True]]),
+                      12: np.array([[False, False, False], [False, False, False], [False, False, True]]),
+                      13: np.array([[True, True], [False, False], [False, False]]),
+                      14: np.array([[True, False, False], [False, False, False], [False, False, False]]),
+                      15: np.array([[True, True], [False, False], [False, False]]),
+                      16: np.array([[False, False, True], [False, False, False], [False, False, False]]),
+                      17: np.array([[True, False, False], [True, False, False]]),
+                      18: np.array([[True, False, False], [False, False, False], [False, False, False]]),
+                      19: np.array([[False, False, True], [False, False, True]]),
+                      20: np.array([[False, False, True], [False, False, False], [False, False, False]]),
+                      21: np.array([[False, False], [False, False], [True, True]]),
+                      22: np.array([[False, False, False], [False, False, False], [True, False, False]]),
+                      23: np.array([[False, False], [False, False], [True, True]]),
+                      24: np.array([[False, False, False], [False, False, False], [False, False, True]]),
+                      25: np.array([[True, False, False], [True, False, False]]),
+                      26: np.array([[False, False, False], [False, False, False], [True, False, False]]),
+                      27: np.array([[False, False, True], [False, False, True]]),
+                      28: np.array([[False, False, False], [False, False, False], [False, False, True]]),
+                      29: np.array([[True, True], [False, False], [False, False]]),
+                      30: np.array([[True, False, False], [False, False, False], [False, False, False]]),
+                      31: np.array([[True, True], [False, False], [False, False]]),
+                      32: np.array([[False, False, True], [False, False, False], [False, False, False]]),
+                      33: np.array([[True, False, False], [True, False, False]]),
+                      34: np.array([[True, False, False], [False, False, False], [False, False, False]]),
+                      35: np.array([[False, False, True], [False, False, True]]),
+                      36: np.array([[False, False, True], [False, False, False], [False, False, False]]),
+                      37: np.array([[False, False], [False, False], [True, True]]),
+                      38: np.array([[False, False, False], [False, False, False], [True, False, False]]),
+                      39: np.array([[False, False], [False, False], [True, True]]),
+                      40: np.array([[False, False, False], [False, False, False], [False, False, True]]),
+                      41: np.array([[True, False, False], [True, False, False]]),
+                      42: np.array([[False, False, False], [False, False, False], [True, False, False]]),
+                      43: np.array([[False, False, True], [False, False, True]]),
+                      44: np.array([[False, False, False], [False, False, False], [False, False, True]]),
+                      45: np.array([[True, True], [False, False], [False, False]]),
+                      46: np.array([[True, False, False], [False, False, False], [False, False, False]]),
+                      47: np.array([[True, True], [False, False], [False, False]]),
+                      48: np.array([[False, False, True], [False, False, False], [False, False, False]])
+    }
 
     # 3 rows for x, y, z, respectively, with start, stop
     self.ranges = {1: np.array([[0,1], [-1,1], [0,0]]),
@@ -279,21 +329,27 @@ class OccupancyGridMap:
 
           sliced = self.curr_grid_map[offset_x[0]:(offset_x[1] + 1), offset_y[0]:(offset_y[1] + 1), offset_z[0]:(offset_z[1] + 1)]
           pre_sliced = self.pre_action_grid_map[offset_x[0]:(offset_x[1] + 1), offset_y[0]:(offset_y[1] + 1), offset_z[0]:(offset_z[1] + 1)]
+          zone_slice = self.pivot_zone_grid_map[offset_x[0]:(offset_x[1] + 1), offset_y[0]:(offset_y[1] + 1), offset_z[0]:(offset_z[1] + 1)]
 
           booled = np.squeeze(sliced > 0)
           pa = self.possible_actions[m]
-          pa[p - 1] = np.all(booled == self.potential_pivots[p])
+          pa[p - 1] = np.all(booled == self.potential_pivots[p]) and np.all(zone_slice)
           self.possible_actions[m] = pa
 
-          pre_booled = np.squeeze(pre_sliced > 0)
-          pre_pa = self.possible_pre_actions[m]
-          pre_pa[p - 1] = np.all(pre_booled == self.potential_pivots[p]) 
-          self.possible_pre_actions[m] = pre_pa
-          self.possible_actions[m] = pa & pre_pa
-          #print(p)
-          #ipdb.set_trace()
-    # print(f"Possible actions: ")
-    #print(self.possible_actions)
+          #pre_booled = np.squeeze(pre_sliced > 0)
+          #pre_pa = self.possible_pre_actions[m]
+          #pre_pa[p - 1] = np.all(pre_booled == self.potential_pivots[p]) 
+          #self.possible_pre_actions[m] = pre_pa
+
+          # get rid of the pre_pa stuff and replace with pivot zones
+          #self.possible_actions[m] = pa & pre_pa 
+
+          # will need to add ranges that will act as no-pivot zones; add to sets
+          # they'll be the offsets, will need a way to check intersections
+          # we can just add 4 to 9 tuple coordinates to the set
+
+          # OR we can create a mirror grid map that shows module numbers where pivots can't happen, and reference against that
+          # self.pivot_zone_grid_map
 
     # for m in self.modules:
     #   print(np.where(self.possible_actions[m])[0] + 1)
@@ -530,16 +586,33 @@ class OccupancyGridMap:
       case 49:
         new_module_position = self.module_positions[module]
 
-
     self.curr_grid_map[module_position[0], module_position[1], module_position[2]] = 0
     self.curr_grid_map[new_module_position[0], new_module_position[1], new_module_position[2]] = module
     self.module_positions[module] =new_module_position
-    self.recenter()
-    self.edges = self.calculate_edges(self.modules, self.module_positions)
+    self.calc_pivot_zones(module, action, module_position)
 
+  def calc_pivot_zones(self, module, action, module_position):
+    if action < 49:
+      rangethingy = self.ranges[action]
+      offset_x = module_position[0] + rangethingy[0]
+      offset_y = module_position[1] + rangethingy[1]
+      offset_z = module_position[2] + rangethingy[2]
+
+      if action < 17:
+        slice = np.expand_dims(self.free_zones[action], axis=2)
+      elif action < 33:
+        slice = np.expand_dims(self.free_zones[action], axis=1)
+      else:
+        slice = np.expand_dims(self.free_zones[action], axis=0)
+
+      self.pivot_zone_grid_map[offset_x[0]:(offset_x[1] + 1), offset_y[0]:(offset_y[1] + 1), offset_z[0]:(offset_z[1] + 1)] = slice
+  
   # once all modules have taken their action during the action phase, we will reset the pre_action_grid_map to curr_grid_map
   def calc_pre_action_grid_map(self):
+    self.recenter()
+    self.edges = self.calculate_edges(self.modules, self.module_positions)
     self.pre_action_grid_map = np.empty_like(self.curr_grid_map)
+    self.pivot_zone_grid_map = np.full(self.curr_grid_map.shape, True)
     self.pre_action_grid_map[:] = self.curr_grid_map
     self.pre_action_edges = self.edges.copy()
     self.pre_action_articulation_points = set(self.articulationPoints(len(self.modules), self.pre_action_edges))
