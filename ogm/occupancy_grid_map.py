@@ -333,7 +333,7 @@ class OccupancyGridMap:
 
           booled = np.squeeze(sliced > 0)
           pa = self.possible_actions[m]
-          pa[p - 1] = np.all(booled == self.potential_pivots[p]) and np.all(zone_slice)
+          pa[p - 1] = np.all(booled == self.potential_pivots[p]) and True#np.all(zone_slice)
           self.possible_actions[m] = pa
 
           #pre_booled = np.squeeze(pre_sliced > 0)
@@ -589,9 +589,10 @@ class OccupancyGridMap:
     self.curr_grid_map[module_position[0], module_position[1], module_position[2]] = 0
     self.curr_grid_map[new_module_position[0], new_module_position[1], new_module_position[2]] = module
     self.module_positions[module] =new_module_position
-    self.calc_pivot_zones(module, action, module_position)
+    self.edges = self.calculate_edges(self.modules, self.module_positions)
+    self.calc_pivot_zones(action, module_position)
 
-  def calc_pivot_zones(self, module, action, module_position):
+  def calc_pivot_zones(self, action, module_position):
     if action < 49:
       rangethingy = self.ranges[action]
       offset_x = module_position[0] + rangethingy[0]
