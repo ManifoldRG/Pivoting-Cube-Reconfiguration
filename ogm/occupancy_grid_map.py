@@ -630,6 +630,29 @@ class OccupancyGridMap:
 
     return pairwise_norms
 
+  # Squared distances matrix (integer on grid)
+  def compute_pairwise_sqdist(self, mod_pos):
+    n = len(mod_pos)
+    sq = np.zeros((n, n), dtype=int)
+    for i in mod_pos.keys():
+      pi = np.array(mod_pos[i])
+      for j in mod_pos.keys():
+        pj = np.array(mod_pos[j])
+        d = pj - pi
+        sq[i-1, j-1] = int(np.dot(d, d))
+    return sq
+
+  # Generate pair list and base bounty values (uniform by default)
+  def generate_pair_bounties(self, final_sqdist, base_value=1.0):
+    n = final_sqdist.shape[0]
+    pairs = []
+    base_vals = []
+    for i in range(n):
+      for j in range(i+1, n):
+        pairs.append((i, j))
+        base_vals.append(float(base_value))
+    return pairs, np.array(base_vals, dtype=float)
+
   def check_final(self, tol=1e-6):
     return np.allclose(self.final_pairwise_norms, self.curr_pairwise_norms, atol=tol)
 
