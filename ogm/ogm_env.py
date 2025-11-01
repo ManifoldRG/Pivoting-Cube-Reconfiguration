@@ -42,18 +42,27 @@ class OGMEnv:
 
         # Return 0 reward if not all modules have acted
         if self.action_count < self.num_modules:
+            self.ogm.take_action(action[0], action[1])
+            # We need to actually take the actions here so that the current grid map is updated; at the end we'll update the pre-action grid map
             return observation, reward, done, info
 
         self.steps_taken += 1
         invalid_move = False
 
+        # we've already "made" the move, so just update the map.
+        self.ogm.calc_pre_action_grid_map()
+        # if I still care about tracking invalid moves, then create a new method to compare against just the current grid map
+
         # Execute buffered actions
-        for module, pivot in self.action_buffer:
-            is_valid_action = self.ogm.calc_possible_actions()[module][pivot-1]
+        """ for module, pivot in self.action_buffer:
+            moves = self.ogm.calc_possible_actions()
+            is_valid_action = moves[module][pivot-1]
+            # we've already "made" the move, so just update the map.
             if is_valid_action:
-                self.ogm.take_action(module, pivot)
+                #self.ogm.take_action(module, pivot)
+                self.ogm.calc_pre_action_grid_map()
             else:
-                invalid_move = True
+                invalid_move = True """
 
         final_norm_diff = np.linalg.norm(
             self.ogm.final_pairwise_norms - self.ogm.curr_pairwise_norms, 'fro'

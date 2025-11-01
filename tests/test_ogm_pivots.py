@@ -48,7 +48,7 @@ class TestOGMPossibleActions(unittest.TestCase):
 
             if is_art:
                 # Articulation points must have no available pivot actions
-                self.assertEqual(pivot_ids, [], msg=f"Module {mod_id} is articulation but has pivots: {pivot_ids}")
+                self.assertEqual(pivot_ids, [49], msg=f"Module {mod_id} is articulation but has pivots: {pivot_ids}")
                 art_points.append(mod_id)
             else:
                 # Non-articulation points must still return a list
@@ -57,6 +57,28 @@ class TestOGMPossibleActions(unittest.TestCase):
         # Check full articulation list matches expected
         self.assertEqual(art_points, expected_articulation_points,
                          msg=f"{expected_articulation_points} are expected articulation points but got {art_points}")
+        
+    def assert_pivot_zones_match(self, module_positions, module_order_sequence, action_sequence, pivot_zones, possible_actions):
+        ogm = occupancy_grid_map.OccupancyGridMap(module_positions, module_positions, len(module_positions))
+        actions_list = []
+
+        for i in range(len(module_order_sequence)):
+            actions = ogm.calc_possible_actions()
+            actions_list.append(actions)
+            ogm.take_action(module_order_sequence[i], action_sequence[i])
+
+        # Check pivot zones
+        self.assertTrue(np.all(ogm.pivot_zone_grid_map == pivot_zones),
+                         msg=f"{pivot_zones} are expected pivot zones but got {ogm.pivot_zone_grid_map}")
+        
+        for mod in actions.keys():
+            self.assertTrue(np.all(actions[mod] == possible_actions[mod]),
+                            msg=f"{possible_actions} are expected possible actions but got {actions}")
+        ogm.calc_pre_action_grid_map()
+        self.assertTrue(np.all(ogm.pivot_zone_grid_map == np.full((9, 9, 9), True)),
+                         msg=f"{np.full((9, 9, 9), True)} are expected reset pivot zones but got {ogm.pivot_zone_grid_map}")
+
+
 
     def test_configuration_case_1(self):
         """
@@ -99,9 +121,46 @@ class TestOGMPossibleActions(unittest.TestCase):
         # Expected articulation point
         expected_aticulation_points = [2]
 
+        # Modules will act in this order:
+        module_order_sequence = [1,2,3]
+
+        # Modules will take these actions, respectively:
+        action_sequence = [12, 49, 49]
+
+        # At the end of the a sequence of actions, we expect this pivot zone array:
+        pivot_zones = np.full((9, 9, 9), True)
+        pivot_zones[4,4,4] = False
+        pivot_zones[4,3,4] = False
+        pivot_zones[3,5,4] = False
+        pivot_zones[3,4,4] = False
+        pivot_zones[3,3,4] = False
+        pivot_zones[2,5,4] = False
+        pivot_zones[2,4,4] = False
+        pivot_zones[2,3,4] = False
+
+        #check that mod3:pivot16 doesn't work
+        possible_actions = {1: np.array([False, False, False, False, False, False, False, False, False,
+       False, False, False, False, False, False, False, False, False,
+       False, False, False, False, False, False, False, False, False,
+       False, False, False, False, False, False, False, False, False,
+       False, False, False, False, False, False, False, False, False,
+       False, False, False,  True]), 2: np.array([False, False, False, False, False, False, False, False, False,
+       False, False, False, False, False, False, False, False, False,
+       False, False, False, False, False, False, False, False, False,
+       False, False, False, False, False, False, False, False, False,
+       False, False, False, False, False, False, False, False, False,
+       False, False, False,  True]), 3: np.array([False, False, False, False, False, False, False, False, False,
+       False, False, False, False,  True, False, False, False, False,
+       False, False, False, False, False, False, False, False, False,
+       False, False,  True, False,  True, False, False, False, False,
+       False, False, False, False, False, False, False, False, False,
+       False, False, False,  True])}
+
         # Run articulation and pivot tests
         self.assert_possible_articulation_point(module_positions, expected_aticulation_points)
         self.assert_possible_actions_match(module_positions, expected_actions)
+        #check that mod3:pivot16 doesn't work
+        self.assert_pivot_zones_match(module_positions, module_order_sequence, action_sequence, pivot_zones, possible_actions)
 
     def test_configuration_case2(self):
         self.assert_possible_actions_match({1:(4,4,4), 2:(4,5,4), 3:(5,5,4)}, {1:[3, 12, 38, 40, 49], 2:[49], 3:[14, 15, 30, 32, 49]})

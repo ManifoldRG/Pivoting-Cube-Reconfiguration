@@ -70,7 +70,8 @@ def train(args):
 
             for aid in random_queue:
                 aid = aid - 1
-                mask = env.ogm.calc_possible_actions()[aid + 1]
+                moves = env.ogm.calc_possible_actions()
+                mask = moves[aid + 1]
                 current_obs = obs
                 action, log_prob = agent.select_action(current_obs, aid, mask=mask)
                 obs, reward, done, _ = env.step((aid+1, action+1))
