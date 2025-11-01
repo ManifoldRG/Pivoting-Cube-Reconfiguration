@@ -333,7 +333,7 @@ class OccupancyGridMap:
 
           booled = np.squeeze(sliced > 0)
           pa = self.possible_actions[m]
-          pa[p - 1] = np.all(booled == self.potential_pivots[p]) and True#np.all(zone_slice)
+          pa[p - 1] = np.all(booled == self.potential_pivots[p]) and np.all(zone_slice)
           self.possible_actions[m] = pa
 
           #pre_booled = np.squeeze(pre_sliced > 0)
