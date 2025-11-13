@@ -52,7 +52,7 @@ class OccupancyGridMap:
     self.init_actions()
     self.calc_pre_action_grid_map()
     self.final_pairwise_norms = self.calc_pairwise_norms(self.final_module_positions)
-    self.curr_pairwise_norms = self.calc_pairwise_norms(self.module_positions)
+    self.curr_pairwise_norms = self.calc_pairwise_norms(self.module_positions) - self.calc_pairwise_norms(self.final_module_positions)
 
   def calculate_grid_size(self, n):
     """Calculate grid size based on number of modules.
@@ -629,6 +629,44 @@ class OccupancyGridMap:
         pairwise_norms[mod-1][mod2-1] = norm(np.array(mod_pos[mod2]) - np.array(mod_pos[mod]), 2)
 
     return pairwise_norms
+  
+  # Four-band reduction on rows
+  def calc_four_band_reduction(self, pairwise_norms):
+    if pairwise_norms.shape[0] > 5:
+      reduced_norms = np.zeros((pairwise_norms.shape[0], 4))
+
+      for i in range(pairwise_norms.shape[0]):
+        if i == 0:
+          reduced_norms[i,:] = pairwise_norms[i,1:5]
+        elif i == 1:
+          reduced_norms[i,0] = pairwise_norms[i,0]
+          reduced_norms[i,1:4] = pairwise_norms[i,2:5]
+        elif i == pairwise_norms.shape[0] - 1:
+          reduced_norms[i,:] = pairwise_norms[i,(pairwise_norms.shape[1] - 5):(pairwise_norms.shape[0] - 1)]
+        elif i == pairwise_norms.shape[0] - 2:
+          reduced_norms[i,0:3] = pairwise_norms[i,(pairwise_norms.shape[1] - 5):(pairwise_norms.shape[0] - 2)]
+          reduced_norms[i,3] = pairwise_norms[i, pairwise_norms.shape[0] - 1]
+        else:
+          reduced_norms[i,0:2] = pairwise_norms[i,(i - 2):i]
+          reduced_norms[i,2:4] = pairwise_norms[i,(i+1):(i+3)]
+      
+      return reduced_norms
+    return pairwise_norms
+  
+  # Local neighborhood reduction
+  # Reduce curr_mat to k rows centered around the module of interest
+  def calc_local_neighborhood_reduction(self, curr_mat, module, k):
+    if curr_mat.shape[0] > k:
+      reduced_mat = np.zeros((k, curr_mat.shape[1]))
+
+      if (module - 1) + (k - 1) >= curr_mat.shape[0]:
+        reduced_mat[0:(curr_mat.shape[0] - module + 1), :] = curr_mat[(module-1):, :]
+        reduced_mat[(curr_mat.shape[0] - module + 1):, :] = curr_mat[0:(k - (curr_mat.shape[0]-module+1)),:]
+      else:
+        reduced_mat = curr_mat[(module-1):(module-1+k)]
+
+      return reduced_mat
+    return curr_mat
 
   # Squared distances matrix (integer on grid)
   def compute_pairwise_sqdist(self, mod_pos):
@@ -654,7 +692,8 @@ class OccupancyGridMap:
     return pairs, np.array(base_vals, dtype=float)
 
   def check_final(self, tol=1e-6):
-    return np.allclose(self.final_pairwise_norms, self.curr_pairwise_norms, atol=tol)
+    #return np.allclose(self.final_pairwise_norms, self.curr_pairwise_norms, atol=tol)
+    return np.allclose(np.zeros(self.curr_pairwise_norms.shape), self.curr_pairwise_norms, atol=tol)
 
   # need to calculate edges first
   def calculate_edges(self, modules, module_positions):
