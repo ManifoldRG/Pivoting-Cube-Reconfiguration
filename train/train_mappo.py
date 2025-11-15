@@ -1,6 +1,7 @@
 import argparse 
 import numpy as np
 from ogm.ogm_env import OGMEnv
+# from agent.simple_ppo_agent import SimplePPOAgent
 from agent.mappo_agent import MAPPOAgent
 from ogm.random_configuration import random_configuration
 import logging
@@ -10,7 +11,6 @@ from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
 from visualizer.step_visualizer import StepVisualizer
 from visualizer import visualize_position
-from numpy.linalg import norm
 
 def setup_logging(log_dir):
     os.makedirs(log_dir, exist_ok=True)
@@ -49,12 +49,17 @@ def train(args):
         step_cost_initial=args.step_cost_initial,
         step_cost_min=args.step_cost_min,
         use_exponential_decay=args.use_exponential_decay,
+        # Soft matching reward parameters
+        enable_soft_matching_reward=args.enable_soft_matching_reward,
+        soft_matching_decay_beta=args.soft_matching_decay_beta,
+        soft_matching_scale=args.soft_matching_scale,
     )
     obs = env.reset(init_conf, final_conf)
     
     # Observation is two stacked (n x n) pairwise norms matrices; agent ctor multiplies by 2
     obs_dim = args.num_agents ** 2
     
+    # Use MAPPOAgent with distance-based action selection
     agent = MAPPOAgent(
         obs_dim, args.num_agents, action_dim=49, lr=args.lr,
         gamma=args.gamma, lam=args.lam, clip=args.clip,
@@ -62,6 +67,16 @@ def train(args):
         hidden_dim=args.hidden_dim, entropy_coef=args.entropy_coef, grad_clip=args.grad_clip,
         distance_temperature=args.distance_temperature, aux_coef=args.aux_coef
     )
+
+    # Legacy SimplePPOAgent (direct logits) - kept for reference:
+    # from agent.simple_ppo_agent import SimplePPOAgent
+    # agent = SimplePPOAgent(
+    #     obs_dim, args.num_agents, action_dim=49, lr=args.lr,
+    #     gamma=args.gamma, lam=args.lam, clip=args.clip,
+    #     epochs=args.epochs, batch_size=args.batch_size,
+    #     hidden_dim=args.hidden_dim, entropy_coef=args.entropy_coef, grad_clip=args.grad_clip,
+    #     value_coef=0.5
+    # )
     success_count = 0
     steps_per_episode = []
     
@@ -94,7 +109,8 @@ def train(args):
                 moves = env.ogm.calc_possible_actions()
                 mask = moves[aid + 1]
                 current_obs = obs
-                # Build candidate post-action pairwise norms (normalized) flattened
+                
+                # Compute candidate pairwise norms for MAPPOAgent (distance-based selection)
                 post_norms = env.ogm.calc_post_pairwise_norms()
                 grid_size = env.ogm.curr_grid_map.shape[0]
                 max_dist = max(np.sqrt(3) * (grid_size - 1), 1.0)
@@ -108,12 +124,7 @@ def train(args):
                         candidates_flat.append(np.zeros((args.num_agents, args.num_agents)).flatten())
                 candidates_flat = np.array(candidates_flat, dtype=np.float32)
 
-                action, log_prob = agent.select_action(current_obs, aid, candidates_flat, mask=mask)
-
-                # Log Frobenius distance of chosen candidate to goal
-                chosen_matrix_norm = candidates_flat[action].reshape(args.num_agents, args.num_agents)
-                frob_to_goal = np.linalg.norm((env.ogm.final_pairwise_norms / max_dist) - chosen_matrix_norm, 'fro')
-                writer.add_scalar("debug/frob_to_goal", frob_to_goal, step)
+                action, log_prob = agent.select_action(current_obs, aid, candidates_flat=candidates_flat, mask=mask)
 
                 obs, reward, done, _ = env.step((aid+1, action+1))
                 agent.store(current_obs, aid, action, log_prob, reward, done, mask, candidates_flat)
@@ -123,6 +134,11 @@ def train(args):
                     visualizer.capture_state()
                 if done or step >= args.max_steps:
                     break
+
+            # Legacy debug metric kept for reference:
+            # chosen_matrix_norm = candidates_flat[action].reshape(args.num_agents, args.num_agents)
+            # frob_to_goal = np.linalg.norm((env.ogm.final_pairwise_norms / max_dist) - chosen_matrix_norm, 'fro')
+            # writer.add_scalar("debug/frob_to_goal", frob_to_goal, step)
 
             episode_reward += phase_reward
             if done or step >= args.max_steps:
@@ -173,6 +189,13 @@ def train(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+    # Soft matching reward parameters
+    parser.add_argument('--enable_soft_matching_reward', action='store_true', 
+                    help='Enable soft pairwise matching reward')
+    parser.add_argument('--soft_matching_decay_beta', type=float, default=0.999,
+                    help='Time decay factor for soft matching reward')
+    parser.add_argument('--soft_matching_scale', type=float, default=100.0,
+                    help='Scaling factor for soft matching reward')
     parser.add_argument('--episodes', type=int, default=100)
     parser.add_argument('--num_agents', type=int, default=3)
     parser.add_argument('--max_steps', type=int, default=500)
@@ -182,11 +205,14 @@ if __name__ == '__main__':
     parser.add_argument('--clip', type=float, default=0.2)
     parser.add_argument('--epochs', type=int, default=4)
     parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--hidden_dim', type=int, default=768)
-    parser.add_argument('--entropy_coef', type=float, default=0.02)
-    parser.add_argument('--grad_clip', type=float, default=0.0)
-    parser.add_argument('--distance_temperature', type=float, default=10.0)
-    parser.add_argument('--aux_coef', type=float, default=0.1)
+    parser.add_argument('--hidden_dim', type=int, default=256)
+    parser.add_argument('--entropy_coef', type=float, default=0.01)
+    parser.add_argument('--grad_clip', type=float, default=0.5)
+    # MAPPOAgent-specific parameters:
+    parser.add_argument('--distance_temperature', type=float, default=10.0,
+                        help='Temperature for distance-based action selection')
+    parser.add_argument('--aux_coef', type=float, default=0.1,
+                        help='Coefficient for auxiliary regression loss')
     parser.add_argument('--log_dir', type=str, default='runs', help='Directory for logs and TensorBoard')
     parser.add_argument('--gif_interval', type=int, default=0, help='Save an episode GIF every N episodes (0 disables)')
     # Reward config CLI switches
@@ -196,7 +222,11 @@ if __name__ == '__main__':
     parser.add_argument('--bounty_base_value', type=float, default=1.0)
     parser.add_argument('--bounty_total_frac_of_success', type=float, default=0.2)
     parser.add_argument('--bounty_cap_per_step', type=float, default=20.0)
-    parser.add_argument('--enable_potential_reward', action='store_true', default=True)
+    parser.add_argument('--enable_potential_reward', action='store_true', default=True,
+                        help='Enable potential-based shaping reward')
+    # Convenience flag to explicitly disable potential reward at CLI
+    parser.add_argument('--disable_potential_reward', action='store_false', dest='enable_potential_reward',
+                        help='Disable potential-based shaping reward (overrides enable flag)')
     parser.add_argument('--potential_scale', type=float, default=1.0)
     parser.add_argument('--potential_normalize', type=str, default='n2', choices=['n2','none'])
     parser.add_argument('--success_bonus', type=float, default=100.0)
