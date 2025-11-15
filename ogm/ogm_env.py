@@ -50,7 +50,7 @@ class OGMEnv:
         self.action_count = 0
         self.num_modules = len(initial_config)
         self.initial_norm_diff = np.linalg.norm(
-            self.ogm.final_pairwise_norms - self.ogm.curr_pairwise_norms, 'fro'
+            self.ogm.curr_pairwise_norms, 'fro'
         )
         
         # Calculate decay rate for exponential step cost
@@ -113,7 +113,7 @@ class OGMEnv:
                 invalid_move = True """
 
         final_norm_diff = np.linalg.norm(
-            self.ogm.final_pairwise_norms - self.ogm.curr_pairwise_norms, 'fro'
+            self.ogm.curr_pairwise_norms, 'fro'
         )
 
         # Calculate reward
