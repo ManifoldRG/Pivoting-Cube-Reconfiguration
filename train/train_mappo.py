@@ -52,7 +52,8 @@ def train(args):
     )
     obs = env.reset(init_conf, final_conf)
     
-    # Observation is two stacked (n x n) pairwise norms matrices; agent ctor multiplies by 2
+    # Observation is a single (n x n) pairwise norms difference matrix; `obs_dim`
+    # is the flattened size of that matrix.
     obs_dim = args.num_agents ** 2
     
     agent = MAPPOAgent(
@@ -101,6 +102,8 @@ def train(args):
                 candidates_flat = []
                 for act_id in range(1, 50):
                     if (aid + 1) in post_norms and act_id in post_norms[aid + 1]:
+                        # `post_norms` entries are already in (current - final)
+                        # space; normalize by max_dist for scale stability.
                         mat = post_norms[aid + 1][act_id] / max_dist
                         candidates_flat.append(mat.flatten())
                     else:
@@ -112,7 +115,9 @@ def train(args):
 
                 # Log Frobenius distance of chosen candidate to goal
                 chosen_matrix_norm = candidates_flat[action].reshape(args.num_agents, args.num_agents)
-                frob_to_goal = np.linalg.norm((env.ogm.final_pairwise_norms / max_dist) - chosen_matrix_norm, 'fro')
+                # In difference space, distance-to-goal is simply the Frobenius
+                # norm of the chosen matrix.
+                frob_to_goal = np.linalg.norm(chosen_matrix_norm, 'fro')
                 writer.add_scalar("debug/frob_to_goal", frob_to_goal, step)
 
                 obs, reward, done, _ = env.step((aid+1, action+1))

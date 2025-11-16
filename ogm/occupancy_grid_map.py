@@ -48,11 +48,14 @@ class OccupancyGridMap:
     self.recenter_to = self.module_positions[1]
     self.modules = range(1, n+1)
     self.edges = self.calculate_edges(self.modules, self.module_positions)
+    # Pre-compute pairwise norms for final configuration and current
+    # configuration; `curr_pairwise_norms` is stored as a difference to the
+    # final configuration so that a zero matrix corresponds to success.
+    self.final_pairwise_norms = self.calc_pairwise_norms(self.final_module_positions)
+    self.curr_pairwise_norms = self.calc_pairwise_norms(self.module_positions) - self.final_pairwise_norms
     #self.pre_action_edges = self.edges.copy()
     self.init_actions()
     self.calc_pre_action_grid_map()
-    self.final_pairwise_norms = self.calc_pairwise_norms(self.final_module_positions)
-    self.curr_pairwise_norms = self.calc_pairwise_norms(self.module_positions) - self.calc_pairwise_norms(self.final_module_positions)
 
   def calculate_grid_size(self, n):
     """Calculate grid size based on number of modules.
@@ -136,7 +139,9 @@ class OccupancyGridMap:
       self.module_positions[module] = new_pos
       self.curr_grid_map[new_pos[0], new_pos[1], new_pos[2]] = module
 
-    self.curr_pairwise_norms = self.calc_pairwise_norms(self.module_positions)
+    # Maintain `curr_pairwise_norms` as (current - final) so that zero means
+    # the structure matches the goal in pairwise-norm space.
+    self.curr_pairwise_norms = self.calc_pairwise_norms(self.module_positions) - self.final_pairwise_norms
 
 
   # probably need each module to track its own position so that they can be easily recentered
@@ -477,8 +482,12 @@ class OccupancyGridMap:
         post_action_module_positions = self.module_positions.copy()
         #post_action_grid_map[module_position[0], module_position[1], module_position[2]] = 0
         #post_action_grid_map[new_module_position[0], new_module_position[1], new_module_position[2]] = module
-        post_action_module_positions[module] =new_module_position
-        self.post_action_pairwise_norms[module][action] = self.calc_pairwise_norms(post_action_module_positions)
+        post_action_module_positions[module] = new_module_position
+        # Store post-action pairwise norms in the same "difference to final"
+        # space used by `curr_pairwise_norms`.
+        self.post_action_pairwise_norms[module][action] = (
+            self.calc_pairwise_norms(post_action_module_positions) - self.final_pairwise_norms
+        )
     return self.post_action_pairwise_norms
       # we also need some way to map the pairwise norms to actions. Maybe just use the keys?
 
@@ -588,9 +597,14 @@ class OccupancyGridMap:
 
     self.curr_grid_map[module_position[0], module_position[1], module_position[2]] = 0
     self.curr_grid_map[new_module_position[0], new_module_position[1], new_module_position[2]] = module
-    self.module_positions[module] =new_module_position
+    self.module_positions[module] = new_module_position
     self.edges = self.calculate_edges(self.modules, self.module_positions)
     self.calc_pivot_zones(action, module_position)
+
+    # Keep `curr_pairwise_norms` in sync with the current configuration,
+    # expressed as (current_pairwise_norms - final_pairwise_norms) so that a
+    # zero matrix corresponds to the goal configuration.
+    self.curr_pairwise_norms = self.calc_pairwise_norms(self.module_positions) - self.final_pairwise_norms
 
   def calc_pivot_zones(self, action, module_position):
     if action < 49:
