@@ -63,8 +63,8 @@ class MAPPOAgent(Agent):
                  entropy_coef=0.02, grad_clip=None, distance_temperature=10.0,
                  aux_coef=0.1):
         self.num_agents = num_agents
-        # The observation now contains TWO maps, so we multiply the base obs_dim by 2.
-        self.obs_dim = (obs_dim * 2) + num_agents
+        # Observation is a single pairwise-norms matrix (flattened) plus agent one-hot.
+        self.obs_dim = obs_dim + num_agents
         self.action_dim = action_dim
         self.gamma = gamma 
         self.lam = lam 

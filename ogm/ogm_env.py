@@ -50,7 +50,7 @@ class OGMEnv:
         self.action_count = 0
         self.num_modules = len(initial_config)
         self.initial_norm_diff = np.linalg.norm(
-            self.ogm.final_pairwise_norms - self.ogm.curr_pairwise_norms, 'fro'
+            self.ogm.curr_pairwise_norms, 'fro'
         )
         
         # Calculate decay rate for exponential step cost
@@ -113,7 +113,7 @@ class OGMEnv:
                 invalid_move = True """
 
         final_norm_diff = np.linalg.norm(
-            self.ogm.final_pairwise_norms - self.ogm.curr_pairwise_norms, 'fro'
+            self.ogm.curr_pairwise_norms, 'fro'
         )
 
         # Calculate reward
@@ -172,8 +172,12 @@ class OGMEnv:
     
     def get_observation(self):
         """
-        Stacks the current and final pairwise norms to create a 2-channel observation.
-        This allows the agent to see both its current shape and its goal shape.
+        Returns a single pairwise norms matrix representing the difference
+        between the current and final configurations.
+
+        `OccupancyGridMap` maintains `curr_pairwise_norms` as
+        (current_pairwise_norms - final_pairwise_norms), so a zero matrix
+        means the goal configuration has been reached.
         """
         if self.ogm is None:
             raise Exception("Environment not set. call reset function")
@@ -183,8 +187,6 @@ class OGMEnv:
         max_dist = np.sqrt(3) * (grid_size - 1)
         max_dist = max(max_dist, 1.0)
 
-        curr = self.ogm.curr_pairwise_norms / max_dist
-        final = self.ogm.final_pairwise_norms / max_dist
-
-        # Shape becomes (2, num_modules, num_modules)
-        return np.stack([curr, final], axis=0)
+        # Single (num_modules x num_modules) matrix, already representing
+        # distance to goal in pairwise-norm space.
+        return self.ogm.curr_pairwise_norms / max_dist 
