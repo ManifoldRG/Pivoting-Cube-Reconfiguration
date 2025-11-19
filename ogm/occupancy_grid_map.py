@@ -646,26 +646,27 @@ class OccupancyGridMap:
   
   # Four-band reduction on rows
   def calc_four_band_reduction(self, pairwise_norms):
-    if pairwise_norms.shape[0] > 5:
-      reduced_norms = np.zeros((pairwise_norms.shape[0], 4))
+    n = pairwise_norms.shape[0]
+    if n <= 5:
+      # For small assemblies, keep the full matrix to preserve information.
+      return pairwise_norms
 
-      for i in range(pairwise_norms.shape[0]):
-        if i == 0:
-          reduced_norms[i,:] = pairwise_norms[i,1:5]
-        elif i == 1:
-          reduced_norms[i,0] = pairwise_norms[i,0]
-          reduced_norms[i,1:4] = pairwise_norms[i,2:5]
-        elif i == pairwise_norms.shape[0] - 1:
-          reduced_norms[i,:] = pairwise_norms[i,(pairwise_norms.shape[1] - 5):(pairwise_norms.shape[0] - 1)]
-        elif i == pairwise_norms.shape[0] - 2:
-          reduced_norms[i,0:3] = pairwise_norms[i,(pairwise_norms.shape[1] - 5):(pairwise_norms.shape[0] - 2)]
-          reduced_norms[i,3] = pairwise_norms[i, pairwise_norms.shape[0] - 1]
+    # Apply reduction to get (n, 4) output
+    reduced_norms = np.zeros((n, 4))
+
+    for i in range(n):
+      # Collect up to 4 bands: 2 before diagonal, 2 after diagonal
+      # Band -2, -1, +1, +2 relative to diagonal
+      bands = []
+      for offset in [-2, -1, 1, 2]:
+        j = i + offset
+        if 0 <= j < n:
+          bands.append(pairwise_norms[i, j])
         else:
-          reduced_norms[i,0:2] = pairwise_norms[i,(i - 2):i]
-          reduced_norms[i,2:4] = pairwise_norms[i,(i+1):(i+3)]
-      
-      return reduced_norms
-    return pairwise_norms
+          bands.append(0.0)
+      reduced_norms[i, :] = bands[:4]
+
+    return reduced_norms
   
   # Local neighborhood reduction
   # Reduce curr_mat to k rows centered around the module of interest

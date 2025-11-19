@@ -143,9 +143,17 @@ def train(args):
         enable_soft_matching_reward=args.enable_soft_matching_reward,
         soft_matching_decay_beta=args.soft_matching_decay_beta,
         soft_matching_scale=args.soft_matching_scale,
+        # Dimension reduction parameters
+        use_four_band_reduction=args.use_four_band_reduction,
+        use_local_neighborhood=args.use_local_neighborhood,
+        local_neighborhood_k=args.local_neighborhood_k,
     )
 
     logging.info("Environment created: %d agents, max_steps=%d", args.num_agents, args.max_steps)
+    logging.info("Dimension reduction: four_band=%s, local_neighborhood=%s (k=%d)",
+                 args.use_four_band_reduction,
+                 args.use_local_neighborhood,
+                 args.local_neighborhood_k)
     logging.info("Soft matching reward: %s (scale=%.2f, beta=%.4f)",
                  args.enable_soft_matching_reward,
                  args.soft_matching_scale,
@@ -308,6 +316,14 @@ if __name__ == '__main__':
                         help='Minimum step cost')
     parser.add_argument('--use_exponential_decay', action='store_true', default=True,
                         help='Use exponential decay for step cost')
+
+    # Dimension reduction parameters
+    parser.add_argument('--use_four_band_reduction', action='store_true',
+                        help='Use four-band reduction (reduces O(n²) to O(n))')
+    parser.add_argument('--use_local_neighborhood', action='store_true',
+                        help='Use local neighborhood reduction (further reduces to O(k))')
+    parser.add_argument('--local_neighborhood_k', type=int, default=3,
+                        help='Number of rows for local neighborhood (default: 3)')
 
     args = parser.parse_args()
 

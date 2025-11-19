@@ -15,7 +15,8 @@ class OGMEnv:
                  potential_scale = 1.0, potential_normalize = 'n2', success_bonus = 100.0,
                  step_cost_initial = -0.01, step_cost_min = -0.001, use_exponential_decay = True,
                  enable_soft_matching_reward = False, soft_matching_decay_beta = 0.999,
-                 soft_matching_scale = 1.0):
+                 soft_matching_scale = 1.0, use_four_band_reduction = False,
+                 use_local_neighborhood = False, local_neighborhood_k = 3):
         # General
         self.step_cost = step_cost
         self.max_steps = max_steps 
@@ -51,6 +52,11 @@ class OGMEnv:
         self.soft_matching_decay_beta = soft_matching_decay_beta
         self.soft_matching_scale = soft_matching_scale
         self.phi_max = 0.0  # Running best score
+
+        # Dimension reduction parameters
+        self.use_four_band_reduction = use_four_band_reduction
+        self.use_local_neighborhood = use_local_neighborhood
+        self.local_neighborhood_k = local_neighborhood_k
 
     def compute_soft_matching_score(self, curr_sqdist, final_sqdist):
         """
@@ -255,21 +261,29 @@ class OGMEnv:
     
     def get_observation(self):
         """
-        Returns a single pairwise norms matrix representing the difference
+        Returns pairwise norms matrix representing the difference
         between the current and final configurations.
 
         `OccupancyGridMap` maintains `curr_pairwise_norms` as
         (current_pairwise_norms - final_pairwise_norms), so a zero matrix
         means the goal configuration has been reached.
+
+        Applies dimension reduction if enabled:
+        - Four-band reduction: reduces n×n to (n, 4)
+        - Local neighborhood: reduces to (k, 4) for k rows around current agent
         """
         if self.ogm is None:
             raise Exception("Environment not set. call reset function")
-        
+
         # Normalize by maximum possible grid distance for scale stability
         grid_size = self.ogm.curr_grid_map.shape[0]
         max_dist = np.sqrt(3) * (grid_size - 1)
         max_dist = max(max_dist, 1.0)
 
-        # Single (num_modules x num_modules) matrix, already representing
-        # distance to goal in pairwise-norm space.
-        return self.ogm.curr_pairwise_norms / max_dist 
+        obs = self.ogm.curr_pairwise_norms
+
+        # Apply four-band reduction if enabled
+        if self.use_four_band_reduction:
+            obs = self.ogm.calc_four_band_reduction(obs)
+
+        return obs / max_dist

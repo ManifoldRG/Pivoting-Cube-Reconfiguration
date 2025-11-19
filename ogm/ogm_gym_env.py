@@ -33,25 +33,56 @@ class OGMGymEnv(gym.Env):
 
         self.action_space = spaces.Discrete(49)
 
-        # Observation space: flattened (2, n, n) pairwise norms + one-hot agent ID
-        # our agent expects: obs.flatten() + one_hot(agent_id)
-        obs_dim = 2 * num_agents * num_agents + num_agents
+        # Calculate observation dimension based on reduction settings
+        use_four_band = env_kwargs.get('use_four_band_reduction', False)
+        use_local_neighborhood = env_kwargs.get('use_local_neighborhood', False)
+        local_k = env_kwargs.get('local_neighborhood_k', 3)
+
+        # Base matrix shape after four-band reduction (if enabled)
+        matrix_rows = num_agents
+        if use_four_band and num_agents > 5:
+            matrix_cols = 4
+        else:
+            matrix_cols = num_agents
+
+        # Local neighborhood can reduce the number of rows that flow to the policy
+        if use_local_neighborhood:
+            effective_rows = min(local_k, matrix_rows)
+        else:
+            effective_rows = matrix_rows
+
+        obs_base_dim = effective_rows * matrix_cols
+
+        # Add one-hot agent ID
+        obs_dim = obs_base_dim + num_agents
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
         )
 
         # Internal state
         self.current_agent_idx = 0  # Which agent is acting (0-indexed)
-        self.raw_obs = None  # The (2, n, n) observation from env
+        self.raw_obs = None  # Raw observation from env (shape depends on reduction settings)
         self.episode_done = False
         self.steps_taken = 0
         self.init_conf = None
         self.final_conf = None
+        self.use_four_band = use_four_band
+        self.use_local_neighborhood = use_local_neighborhood
+        self.local_k = local_k
 
     def _get_obs(self):
         """Convert raw obs + agent ID into the format our model expects."""
-        # Flatten the (2, n, n) observation
-        obs_flat = self.raw_obs.flatten()
+        obs = self.raw_obs
+
+        # Apply local neighborhood reduction if enabled
+        if self.use_local_neighborhood and self.env.ogm is not None:
+            # Agent IDs are 1-indexed in OGM
+            obs = self.env.ogm.calc_local_neighborhood_reduction(
+                obs, self.current_agent_idx + 1, self.local_k
+            )
+
+        # Flatten the observation
+        obs_flat = obs.flatten()
 
         # Create one-hot encoding for current agent
         agent_onehot = np.zeros(self.num_agents, dtype=np.float32)
