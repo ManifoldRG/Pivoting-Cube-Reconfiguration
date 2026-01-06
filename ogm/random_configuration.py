@@ -53,9 +53,11 @@ def make_connected_positions(n, grid_size, starter = None):
 
 
 def random_configuration(n):
-    # Can change grid size matching with ogm, but recentering might cause problem, so made n + 3 instead of 2n+3
-    grid_size = max(5,  n + 3)
+    # Match grid size with OGM (2n+3)
+    grid_size = max(5, 2*n+3)
 
+    # Generate two random configurations
     init = make_connected_positions(n, grid_size)
-    final = make_connected_positions(n, grid_size, init[np.random.choice(list(init.keys()))])
-    return init, final, max(5, 2*n+3)
+    final = make_connected_positions(n, grid_size) 
+    
+    return init, final, grid_size

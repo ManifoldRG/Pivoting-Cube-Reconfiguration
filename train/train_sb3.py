@@ -11,10 +11,10 @@ import numpy as np
 from sb3_contrib import MaskablePPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.logger import configure
+from ogm.ogm_gym_env import OGMGymEnv
 
-from ogm.ogm_gym_env import make_ogm_env
 from visualizer.step_visualizer import StepVisualizer
-
+from agent.feature_extractors import RecurrentFeatureExtractor
 
 def setup_logging(log_dir):
     """Setup logging to file and console."""
@@ -35,11 +35,10 @@ class CustomCallback(BaseCallback):
     """
     Custom callback to track episode metrics and generate GIFs.
     """
-    def __init__(self, gif_interval=0, log_dir=None, num_agents=3, verbose=0):
+    def __init__(self, gif_interval=0, log_dir=None,verbose=0):
         super().__init__(verbose)
         self.gif_interval = gif_interval
         self.log_dir = log_dir
-        self.num_agents = num_agents
         self.episode_count = 0
         self.success_count = 0
         self.episode_rewards = []
@@ -116,16 +115,17 @@ class CustomCallback(BaseCallback):
                 self.episode_count
             )
 
-
+MIN_AGENTS = 6
+MAX_AGENTS = 7
 def train(args):
     """Main training loop using SB3."""
     setup_logging(args.log_dir)
 
     # Create environment with your custom rewards
-    env = make_ogm_env(
-        num_agents=args.num_agents,
+    env = OGMGymEnv(
         max_steps=args.max_steps,
         step_cost=-0.01,
+        agents_range=(MIN_AGENTS,MAX_AGENTS),
         enable_bounty_reward=args.enable_bounty_reward,
         bounty_gamma=args.bounty_gamma,
         bounty_eta=args.bounty_eta,
@@ -144,16 +144,9 @@ def train(args):
         soft_matching_decay_beta=args.soft_matching_decay_beta,
         soft_matching_scale=args.soft_matching_scale,
         # Dimension reduction parameters
-        use_four_band_reduction=args.use_four_band_reduction,
-        use_local_neighborhood=args.use_local_neighborhood,
-        local_neighborhood_k=args.local_neighborhood_k,
     )
 
-    logging.info("Environment created: %d agents, max_steps=%d", args.num_agents, args.max_steps)
-    logging.info("Dimension reduction: four_band=%s, local_neighborhood=%s (k=%d)",
-                 args.use_four_band_reduction,
-                 args.use_local_neighborhood,
-                 args.local_neighborhood_k)
+    logging.info("Environment created: min_agents=%d,max_agents=%d, max_steps=%d", MIN_AGENTS, MAX_AGENTS, args.max_steps)
     logging.info("Soft matching reward: %s (scale=%.2f, beta=%.4f)",
                  args.enable_soft_matching_reward,
                  args.soft_matching_scale,
@@ -161,10 +154,10 @@ def train(args):
 
     # Configure SB3 logger for tensorboard
     sb3_logger = configure(args.log_dir, ["stdout", "tensorboard"])
-
+    MEAN_AGENTS = (MIN_AGENTS + MAX_AGENTS)//2
     # Create MaskablePPO model
     model = MaskablePPO(
-        "MlpPolicy",
+        "MultiInputPolicy",
         env,
         learning_rate=args.lr,
         n_steps=args.n_steps,  # Steps per rollout
@@ -178,9 +171,11 @@ def train(args):
         max_grad_norm=args.grad_clip,
         verbose=1,
         tensorboard_log=args.log_dir,
-        policy_kwargs={
-            "net_arch": [args.hidden_dim, args.hidden_dim]  # 2-layer network
-        }
+        policy_kwargs=dict(
+            features_extractor_class=RecurrentFeatureExtractor,
+            features_extractor_kwargs=dict(embedded_dim=128),
+            net_arch=[args.hidden_dim, args.hidden_dim]
+        )
     )
 
     model.set_logger(sb3_logger)
@@ -194,13 +189,12 @@ def train(args):
     callback = CustomCallback(
         gif_interval=args.gif_interval,
         log_dir=args.log_dir,
-        num_agents=args.num_agents,
         verbose=1
     )
 
     # Calculate total timesteps based on episodes
-    # Each episode is roughly (num_agents * steps_per_episode) environment steps
-    total_timesteps = args.episodes * args.max_steps * args.num_agents
+    # Each episode is roughly (steps_per_episode * max_steps * mean_agents) environment steps
+    total_timesteps = args.episodes * args.max_steps * MEAN_AGENTS
     logging.info("Starting training for %d total timesteps (~%d episodes)",
                  total_timesteps, args.episodes)
 
@@ -237,8 +231,6 @@ if __name__ == '__main__':
     # Training parameters
     parser.add_argument('--episodes', type=int, default=100,
                         help='Approximate number of episodes to train')
-    parser.add_argument('--num_agents', type=int, default=3,
-                        help='Number of agents in the environment')
     parser.add_argument('--max_steps', type=int, default=500,
                         help='Maximum steps per episode')
 
@@ -259,7 +251,7 @@ if __name__ == '__main__':
                         help='Number of epochs per update')
     parser.add_argument('--batch_size', type=int, default=64,
                         help='Batch size for training')
-    parser.add_argument('--hidden_dim', type=int, default=256,
+    parser.add_argument('--hidden_dim', type=int, default=128,
                         help='Hidden layer dimension')
     parser.add_argument('--entropy_coef', type=float, default=0.01,
                         help='Entropy coefficient')
@@ -302,7 +294,7 @@ if __name__ == '__main__':
     parser.add_argument('--disable_potential_reward', action='store_false',
                         dest='enable_potential_reward',
                         help='Disable potential-based shaping reward')
-    parser.add_argument('--potential_scale', type=float, default=1.0,
+    parser.add_argument('--potential_scale', type=float, default=10,
                         help='Scaling factor for potential reward')
     parser.add_argument('--potential_normalize', type=str, default='n2',
                         choices=['n2', 'none'], help='Normalization for potential reward')
@@ -317,18 +309,10 @@ if __name__ == '__main__':
     parser.add_argument('--use_exponential_decay', action='store_true', default=True,
                         help='Use exponential decay for step cost')
 
-    # Dimension reduction parameters
-    parser.add_argument('--use_four_band_reduction', action='store_true',
-                        help='Use four-band reduction (reduces O(n²) to O(n))')
-    parser.add_argument('--use_local_neighborhood', action='store_true',
-                        help='Use local neighborhood reduction (further reduces to O(k))')
-    parser.add_argument('--local_neighborhood_k', type=int, default=3,
-                        help='Number of rows for local neighborhood (default: 3)')
-
     args = parser.parse_args()
 
     # Create log directory with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    args.log_dir = os.path.join(args.log_dir, f"n{args.num_agents}_{timestamp}")
+    args.log_dir = os.path.join(args.log_dir, f"n{MIN_AGENTS}_to_n{MAX_AGENTS}_{timestamp}")
 
     train(args)

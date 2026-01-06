@@ -49,10 +49,8 @@ class OccupancyGridMap:
     self.modules = range(1, n+1)
     self.edges = self.calculate_edges(self.modules, self.module_positions)
     # Pre-compute pairwise norms for final configuration and current
-    # configuration; `curr_pairwise_norms` is stored as a difference to the
-    # final configuration so that a zero matrix corresponds to success.
     self.final_pairwise_norms = self.calc_pairwise_norms(self.final_module_positions)
-    self.curr_pairwise_norms = self.calc_pairwise_norms(self.module_positions) - self.final_pairwise_norms
+    self.curr_pairwise_norms = self.calc_pairwise_norms(self.module_positions) 
     #self.pre_action_edges = self.edges.copy()
     self.init_actions()
     self.calc_pre_action_grid_map()
@@ -139,9 +137,7 @@ class OccupancyGridMap:
       self.module_positions[module] = new_pos
       self.curr_grid_map[new_pos[0], new_pos[1], new_pos[2]] = module
 
-    # Maintain `curr_pairwise_norms` as (current - final) so that zero means
-    # the structure matches the goal in pairwise-norm space.
-    self.curr_pairwise_norms = self.calc_pairwise_norms(self.module_positions) - self.final_pairwise_norms
+    self.curr_pairwise_norms = self.calc_pairwise_norms(self.module_positions)
 
 
   # probably need each module to track its own position so that they can be easily recentered
@@ -601,10 +597,7 @@ class OccupancyGridMap:
     self.edges = self.calculate_edges(self.modules, self.module_positions)
     self.calc_pivot_zones(action, module_position)
 
-    # Keep `curr_pairwise_norms` in sync with the current configuration,
-    # expressed as (current_pairwise_norms - final_pairwise_norms) so that a
-    # zero matrix corresponds to the goal configuration.
-    self.curr_pairwise_norms = self.calc_pairwise_norms(self.module_positions) - self.final_pairwise_norms
+    self.curr_pairwise_norms = self.calc_pairwise_norms(self.module_positions) 
 
   def calc_pivot_zones(self, action, module_position):
     if action < 49:
@@ -647,41 +640,27 @@ class OccupancyGridMap:
   # Four-band reduction on rows
   def calc_four_band_reduction(self, pairwise_norms):
     n = pairwise_norms.shape[0]
-    if n <= 5:
-      # For small assemblies, keep the full matrix to preserve information.
-      return pairwise_norms
+    if n <= 4:
+      raise ValueError("Four-band reduction requires at least 5 modules")
 
     # Apply reduction to get (n, 4) output
+    # Take next 4 columns after diagonal (upper triangular bands)
     reduced_norms = np.zeros((n, 4))
 
     for i in range(n):
-      # Collect up to 4 bands: 2 before diagonal, 2 after diagonal
-      # Band -2, -1, +1, +2 relative to diagonal
+      # Collect next 4 bands: offsets +1, +2, +3, +4 relative to diagonal
+      # This gives upper triangular without padding for most rows
       bands = []
-      for offset in [-2, -1, 1, 2]:
+      for offset in [1, 2, 3, 4]:
         j = i + offset
-        if 0 <= j < n:
+        if j < n:
           bands.append(pairwise_norms[i, j])
         else:
-          bands.append(0.0)
+          bands.append(0.0)  # Only last few rows need padding
       reduced_norms[i, :] = bands[:4]
 
     return reduced_norms
   
-  # Local neighborhood reduction
-  # Reduce curr_mat to k rows centered around the module of interest
-  def calc_local_neighborhood_reduction(self, curr_mat, module, k):
-    if curr_mat.shape[0] > k:
-      reduced_mat = np.zeros((k, curr_mat.shape[1]))
-
-      if (module - 1) + (k - 1) >= curr_mat.shape[0]:
-        reduced_mat[0:(curr_mat.shape[0] - module + 1), :] = curr_mat[(module-1):, :]
-        reduced_mat[(curr_mat.shape[0] - module + 1):, :] = curr_mat[0:(k - (curr_mat.shape[0]-module+1)),:]
-      else:
-        reduced_mat = curr_mat[(module-1):(module-1+k)]
-
-      return reduced_mat
-    return curr_mat
 
   # Squared distances matrix (integer on grid)
   def compute_pairwise_sqdist(self, mod_pos):
@@ -704,11 +683,10 @@ class OccupancyGridMap:
       for j in range(i+1, n):
         pairs.append((i, j))
         base_vals.append(float(base_value))
-    return pairs, np.array(base_vals, dtype=float)
+    return pairs, np.array(base_vals, dtype=np.float32)
 
   def check_final(self, tol=1e-6):
-    #return np.allclose(self.final_pairwise_norms, self.curr_pairwise_norms, atol=tol)
-    return np.allclose(np.zeros(self.curr_pairwise_norms.shape), self.curr_pairwise_norms, atol=tol)
+    return np.allclose(np.zeros(self.curr_pairwise_norms.shape), self.curr_pairwise_norms - self.final_pairwise_norms, atol=tol)
 
   # need to calculate edges first
   def calculate_edges(self, modules, module_positions):

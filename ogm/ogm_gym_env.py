@@ -19,81 +19,65 @@ class OGMGymEnv(gym.Env):
     """
     metadata = {'render_modes': []}
 
-    def __init__(self, num_agents=3, max_steps=500, **env_kwargs):
+    def __init__(self, max_steps=500, agents_range=(5,12), **env_kwargs):
         super().__init__()
 
-        self.num_agents = num_agents
         self.max_steps = max_steps
-
-        # Create the underlying OGM environment with all our custom rewards
-        # OGMEnv counts individual agent actions, so multiply by num_agents
-        # to get the desired number of "phases" (all agents act once = 1 phase)
-        ogm_max_steps = max_steps * num_agents if max_steps is not None else None
-        self.env = OGMEnv(max_steps=ogm_max_steps, **env_kwargs)
-
-        self.action_space = spaces.Discrete(49)
-
-        # Calculate observation dimension based on reduction settings
-        use_four_band = env_kwargs.get('use_four_band_reduction', False)
-        use_local_neighborhood = env_kwargs.get('use_local_neighborhood', False)
-        local_k = env_kwargs.get('local_neighborhood_k', 3)
-
-        # Base matrix shape after four-band reduction (if enabled)
-        matrix_rows = num_agents
-        if use_four_band and num_agents > 5:
-            matrix_cols = 4
-        else:
-            matrix_cols = num_agents
-
-        # Local neighborhood can reduce the number of rows that flow to the policy
-        if use_local_neighborhood:
-            effective_rows = min(local_k, matrix_rows)
-        else:
-            effective_rows = matrix_rows
-
-        obs_base_dim = effective_rows * matrix_cols
-
-        # Add one-hot agent ID
-        obs_dim = obs_base_dim + num_agents
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
+        self.min_agents = agents_range[0]
+        self.max_agents = agents_range[1]
+        
+        config_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(self.max_agents,4), dtype=np.float32
         )
+
+        self.observation_space = spaces.Dict({
+            "current_config": config_space,
+            "final_config": config_space,
+            "agent_id": spaces.Box(low=1,high=self.max_agents,dtype=np.float32, shape=(1,)),
+            "num_agents": spaces.Box(low=self.min_agents,high=self.max_agents,dtype=np.float32,shape=(1,))
+        })
+  
+        self.env_kwargs = env_kwargs
+        
+        self.action_space = spaces.Discrete(49)
 
         # Internal state
         self.current_agent_idx = 0  # Which agent is acting (0-indexed)
-        self.raw_obs = None  # Raw observation from env (shape depends on reduction settings)
+        self.raw_obs: np.ndarray = None  # Raw observation from env 
         self.episode_done = False
         self.steps_taken = 0
         self.init_conf = None
         self.final_conf = None
-        self.use_four_band = use_four_band
-        self.use_local_neighborhood = use_local_neighborhood
-        self.local_k = local_k
+
 
     def _get_obs(self):
         """Convert raw obs + agent ID into the format our model expects."""
-        obs = self.raw_obs
+        max_dist = np.sqrt(3) * (self.env.ogm.calculate_grid_size(self.max_agents) - 1)
+        obs = self.raw_obs.astype(np.float32) / max_dist
+        assert hasattr(self,"env")
+        current_config = obs[:self.num_agents,:]
+        final_config = obs[self.num_agents:,:]
+        padding = np.zeros((self.max_agents-self.num_agents ,4), dtype=np.float32)
+        current_config = np.concatenate([current_config,padding],axis=0)
+        final_config = np.concatenate([final_config,padding],axis=0)
+        return {
+            "agent_id": self.current_agent_idx+1,
+            "current_config": current_config,
+            "final_config": final_config,
+            "num_agents": self.num_agents
+        }
 
-        # Apply local neighborhood reduction if enabled
-        if self.use_local_neighborhood and self.env.ogm is not None:
-            # Agent IDs are 1-indexed in OGM
-            obs = self.env.ogm.calc_local_neighborhood_reduction(
-                obs, self.current_agent_idx + 1, self.local_k
-            )
-
-        # Flatten the observation
-        obs_flat = obs.flatten()
-
-        # Create one-hot encoding for current agent
-        agent_onehot = np.zeros(self.num_agents, dtype=np.float32)
-        agent_onehot[self.current_agent_idx] = 1.0
-
-        # Concatenate: [obs_flat, agent_onehot]
-        return np.concatenate([obs_flat, agent_onehot])
-
-    def reset(self, seed=None, options=None):
+    def reset(self, num_agents=None, seed=None, options=None):
         """Reset environment and return initial observation."""
         super().reset(seed=seed)
+        if num_agents is None:
+            num_agents = np.random.choice(range(self.min_agents, self.max_agents+1))
+        self.num_agents = num_agents
+        # Create the underlying OGM environment with all our custom rewards
+        # OGMEnv counts individual agent actions, so multiply by num_agents
+        # to get the desired number of "phases" (all agents act once = 1 phase)
+        ogm_max_steps = self.max_steps * num_agents if self.max_steps is not None else None
+        self.env = OGMEnv(max_steps=ogm_max_steps, **self.env_kwargs)
 
         # Generate random configuration
         self.init_conf, self.final_conf, _ = random_configuration(self.num_agents)
@@ -168,9 +152,3 @@ class OGMGymEnv(gym.Env):
 
         return obs, float(reward), terminated, truncated, info
 
-
-def make_ogm_env(num_agents=3, **kwargs):
-    """
-    Factory function to create OGM gym environment.
-    """
-    return OGMGymEnv(num_agents=num_agents, **kwargs)
