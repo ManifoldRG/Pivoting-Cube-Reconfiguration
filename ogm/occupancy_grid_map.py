@@ -1,6 +1,7 @@
 import numpy as np
 from numpy.linalg import norm
 from collections import deque
+from munkres import Munkres
 
 class OccupancyGridMap:
   def __init__(self, module_positions, final_module_positions, n):
@@ -17,6 +18,7 @@ class OccupancyGridMap:
     if n <= 0:
         raise ValueError("Number of modules must be positive")
     
+    self.m = Munkres()
     # Store original module positions before recentering
     self.original_module_positions = module_positions.copy()
     self.original_final_module_positions = final_module_positions.copy()
@@ -52,7 +54,8 @@ class OccupancyGridMap:
     # configuration; `curr_pairwise_norms` is stored as a difference to the
     # final configuration so that a zero matrix corresponds to success.
     self.final_pairwise_norms = self.calc_pairwise_norms(self.final_module_positions)
-    self.curr_pairwise_norms = self.calc_pairwise_norms(self.module_positions) - self.final_pairwise_norms
+    mat1 = self.calc_pairwise_norms(self.module_positions)
+    self.curr_pairwise_norms = mat1 - self.calc_current_v_reassigned_final(mat1, self.final_pairwise_norms)
     #self.pre_action_edges = self.edges.copy()
     self.init_actions()
     self.calc_pre_action_grid_map()
@@ -141,8 +144,8 @@ class OccupancyGridMap:
 
     # Maintain `curr_pairwise_norms` as (current - final) so that zero means
     # the structure matches the goal in pairwise-norm space.
-    self.curr_pairwise_norms = self.calc_pairwise_norms(self.module_positions) - self.final_pairwise_norms
-
+    mat1 = self.calc_pairwise_norms(self.module_positions)
+    self.curr_pairwise_norms = mat1 - self.calc_current_v_reassigned_final(mat1, self.final_pairwise_norms)
 
   # probably need each module to track its own position so that they can be easily recentered
 
@@ -485,8 +488,9 @@ class OccupancyGridMap:
         post_action_module_positions[module] = new_module_position
         # Store post-action pairwise norms in the same "difference to final"
         # space used by `curr_pairwise_norms`.
+        mat1 = self.calc_pairwise_norms(post_action_module_positions)
         self.post_action_pairwise_norms[module][action] = (
-            self.calc_pairwise_norms(post_action_module_positions) - self.final_pairwise_norms
+            mat1 - self.calc_current_v_reassigned_final(mat1, self.final_pairwise_norms)
         )
     return self.post_action_pairwise_norms
       # we also need some way to map the pairwise norms to actions. Maybe just use the keys?
@@ -604,7 +608,8 @@ class OccupancyGridMap:
     # Keep `curr_pairwise_norms` in sync with the current configuration,
     # expressed as (current_pairwise_norms - final_pairwise_norms) so that a
     # zero matrix corresponds to the goal configuration.
-    self.curr_pairwise_norms = self.calc_pairwise_norms(self.module_positions) - self.final_pairwise_norms
+    mat1 = self.calc_pairwise_norms(self.module_positions)
+    self.curr_pairwise_norms = mat1 - self.calc_current_v_reassigned_final(mat1, self.final_pairwise_norms)
 
   def calc_pivot_zones(self, action, module_position):
     if action < 49:
@@ -693,7 +698,41 @@ class OccupancyGridMap:
         d = pj - pi
         sq[i-1, j-1] = int(np.dot(d, d))
     return sq
+  
+  # Calculate cost assignment matrix
+  def calc_cost_assignment_matrix(self, mat1, mat2):
+    cost_assignment_matrix = np.zeros(mat1.shape)
 
+    for i in range(mat1.shape[0]):
+      module1 = np.sort(mat1[i][:])
+
+      for j in range(mat2.shape[0]):
+        module2 = np.sort(mat2[j][:])
+        cost_assignment_matrix[i][j] = sum((module2 - module1) ** 2)
+    return cost_assignment_matrix
+  
+  # Use Hungarian method to calculate assignment
+  def calc_assignment(self, cost_assignment_matrix):
+    indexes = self.m.compute(cost_assignment_matrix)
+    return indexes
+  
+  # Rearrange 2nd (presumably final) configuration matrix using assignment indices
+  def calc_rearranged_mat(self, indexes, mat):
+    rearranged_mat = np.zeros(mat.shape)
+
+    for row, column in indexes:
+      for row2, column2 in indexes:
+        rearranged_mat[row][row2] = mat[column][column2]
+
+    return rearranged_mat
+  
+  # Calculate 2nd matrix with correct assignment
+  def calc_current_v_reassigned_final(self, mat1, mat2):
+    cost_assignment_matrix = self.calc_cost_assignment_matrix(mat1, mat2)
+    indexes = self.calc_assignment(cost_assignment_matrix)
+    rearranged_mat2 = self.calc_rearranged_mat(indexes, mat2)
+    return rearranged_mat2
+    
   # Generate pair list and base bounty values (uniform by default)
   def generate_pair_bounties(self, final_sqdist, base_value=1.0):
     n = final_sqdist.shape[0]
@@ -704,7 +743,7 @@ class OccupancyGridMap:
         pairs.append((i, j))
         base_vals.append(float(base_value))
     return pairs, np.array(base_vals, dtype=float)
-
+  
   def check_final(self, tol=1e-6):
     #return np.allclose(self.final_pairwise_norms, self.curr_pairwise_norms, atol=tol)
     return np.allclose(np.zeros(self.curr_pairwise_norms.shape), self.curr_pairwise_norms, atol=tol)
