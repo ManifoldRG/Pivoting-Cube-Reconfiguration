@@ -257,16 +257,17 @@ class OGMEnv:
 
     def get_observation(self):
         """
-        Returns concatenated pairwise norms: [current_config, goal_config].
-        Both are reduced to 4-band representation.
+        Returns pairwise norms: {current_config, goal_config}.
         """
         if self.ogm is None:
             raise Exception("Environment not set. call reset function")
 
       
 
-        # Get 4-band reduced representations of current and goal configurations
-        current_config = self.ogm.calc_four_band_reduction(self.ogm.curr_pairwise_norms)
-        final_config = self.ogm.calc_four_band_reduction(self.ogm.final_pairwise_norms) 
+        current_config = self.ogm.curr_pairwise_norms
+        final_config = self.ogm.final_pairwise_norms
 
-        return np.concatenate([current_config, final_config],axis=0)
+        return {
+            "current_config" : current_config,
+            "final_config": final_config
+        }

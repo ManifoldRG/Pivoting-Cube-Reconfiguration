@@ -13,8 +13,8 @@ from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.logger import configure
 from ogm.ogm_gym_env import OGMGymEnv
 
-from visualizer.step_visualizer import StepVisualizer
-from agent.feature_extractors import RecurrentFeatureExtractor
+from feature_extractors.recurrent import RecurrentFeatureExtractor
+from feature_extractors.fixed_agents_extractor import FixedAgentsFeatureExtractor
 
 def setup_logging(log_dir):
     """Setup logging to file and console."""
@@ -115,8 +115,8 @@ class CustomCallback(BaseCallback):
                 self.episode_count
             )
 
-MIN_AGENTS = 6
-MAX_AGENTS = 7
+MIN_AGENTS = 5
+MAX_AGENTS = 5
 def train(args):
     """Main training loop using SB3."""
     setup_logging(args.log_dir)
@@ -172,8 +172,8 @@ def train(args):
         verbose=1,
         tensorboard_log=args.log_dir,
         policy_kwargs=dict(
-            features_extractor_class=RecurrentFeatureExtractor,
-            features_extractor_kwargs=dict(embedded_dim=128),
+            features_extractor_class=FixedAgentsFeatureExtractor,
+            features_extractor_kwargs=dict(num_agents=MEAN_AGENTS),
             net_arch=[args.hidden_dim, args.hidden_dim]
         )
     )

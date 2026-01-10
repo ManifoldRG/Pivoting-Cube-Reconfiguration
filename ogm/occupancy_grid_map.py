@@ -637,29 +637,6 @@ class OccupancyGridMap:
 
     return pairwise_norms
   
-  # Four-band reduction on rows
-  def calc_four_band_reduction(self, pairwise_norms):
-    n = pairwise_norms.shape[0]
-    if n <= 4:
-      raise ValueError("Four-band reduction requires at least 5 modules")
-
-    # Apply reduction to get (n, 4) output
-    # Take next 4 columns after diagonal (upper triangular bands)
-    reduced_norms = np.zeros((n, 4))
-
-    for i in range(n):
-      # Collect next 4 bands: offsets +1, +2, +3, +4 relative to diagonal
-      # This gives upper triangular without padding for most rows
-      bands = []
-      for offset in [1, 2, 3, 4]:
-        j = i + offset
-        if j < n:
-          bands.append(pairwise_norms[i, j])
-        else:
-          bands.append(0.0)  # Only last few rows need padding
-      reduced_norms[i, :] = bands[:4]
-
-    return reduced_norms
   
 
   # Squared distances matrix (integer on grid)

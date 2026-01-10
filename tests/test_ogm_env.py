@@ -2,7 +2,7 @@ import math
 import numpy as np
 
 from ogm.ogm_env import OGMEnv
-from ogm.random_configuration import random_configuration
+from utils.random_configuration import random_configuration
 from agent.random_search_agent import RandomSearchAgent
 
 

@@ -6,7 +6,7 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 from ogm.ogm_env import OGMEnv
-from ogm.random_configuration import random_configuration
+from utils.random_configuration import random_configuration
 
 
 class OGMGymEnv(gym.Env):
@@ -27,7 +27,7 @@ class OGMGymEnv(gym.Env):
         self.max_agents = agents_range[1]
         
         config_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.max_agents,4), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self.max_agents,self.max_agents), dtype=np.float32
         )
 
         self.observation_space = spaces.Dict({
@@ -49,17 +49,24 @@ class OGMGymEnv(gym.Env):
         self.init_conf = None
         self.final_conf = None
 
-
+    def pad_pairwise_dist_matrix(self,matrix):
+        padding_bottom = np.zeros((self.max_agents-self.num_agents ,self.num_agents), dtype=np.float32)
+        matrix = np.concatenate([matrix, padding_bottom], axis=0)
+        padding_right = np.zeros((self.max_agents, self.max_agents-self.num_agents))
+        matrix = np.concatenate([matrix, padding_right], axis=1)
+        return matrix
     def _get_obs(self):
         """Convert raw obs + agent ID into the format our model expects."""
-        max_dist = np.sqrt(3) * (self.env.ogm.calculate_grid_size(self.max_agents) - 1)
-        obs = self.raw_obs.astype(np.float32) / max_dist
         assert hasattr(self,"env")
-        current_config = obs[:self.num_agents,:]
-        final_config = obs[self.num_agents:,:]
-        padding = np.zeros((self.max_agents-self.num_agents ,4), dtype=np.float32)
-        current_config = np.concatenate([current_config,padding],axis=0)
-        final_config = np.concatenate([final_config,padding],axis=0)
+        max_dist = np.sqrt(3) * (self.env.ogm.calculate_grid_size(self.max_agents) - 1)
+
+        obs = self.raw_obs
+
+        current_config = obs["current_config"].astype(np.float32) / max_dist
+        final_config = obs["final_config"].astype(np.float32) / max_dist
+        
+        current_config = self.pad_pairwise_dist_matrix(current_config)
+        final_config = self.pad_pairwise_dist_matrix(final_config)
         return {
             "agent_id": self.current_agent_idx+1,
             "current_config": current_config,

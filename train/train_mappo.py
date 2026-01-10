@@ -3,7 +3,7 @@ import numpy as np
 from ogm.ogm_env import OGMEnv
 # from agent.simple_ppo_agent import SimplePPOAgent
 from agent.mappo_agent import MAPPOAgent
-from ogm.random_configuration import random_configuration
+from utils.random_configuration import random_configuration
 import logging
 import os
 from datetime import datetime
