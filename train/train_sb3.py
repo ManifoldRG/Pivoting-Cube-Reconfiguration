@@ -268,14 +268,14 @@ if __name__ == '__main__':
 
     # Soft matching reward parameters
     parser.add_argument('--enable_soft_matching_reward', action='store_true',
-                        help='Enable soft pairwise matching reward')
+                        help='Enable soft pairwise matching reward', default=False)
     parser.add_argument('--soft_matching_decay_beta', type=float, default=0.999,
                         help='Time decay factor for soft matching reward')
     parser.add_argument('--soft_matching_scale', type=float, default=100.0,
                         help='Scaling factor for soft matching reward')
 
     # Bounty reward parameters
-    parser.add_argument('--enable_bounty_reward', action='store_true',
+    parser.add_argument('--enable_bounty_reward', action='store_true', default=False,
                         help='Enable bounty reward system')
     parser.add_argument('--bounty_gamma', type=float, default=0.999,
                         help='Bounty decay factor')

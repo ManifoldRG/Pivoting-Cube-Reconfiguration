@@ -1,41 +1,12 @@
 from agent.base_agent import Agent
 import numpy as np
-
+from ogm.ogm_env import OGMEnv
 class RandomSearchAgent(Agent):
     def __init__(self, max_steps=1000):
         super().__init__()
         self.max_steps = max_steps
         self.steps_taken = 0
         self.success = False
-
-    def search(self, ogm, visualizer=None):
-        ogm.init_actions()
-
-        while self.steps_taken < self.max_steps:
-
-            if visualizer:
-                visualizer.capture_state()
-
-            possible_actions = ogm.calc_possible_actions()
-            module, action = self.select_action(possible_actions, len(ogm.modules))
-            ogm.take_action(module, action)
-            self.steps_taken += 1
-
-            if ogm.check_final():
-                self.success = True
-                print(f"Goal reached in {self.steps_taken} steps!")
-
-                if visualizer:
-                    visualizer.capture_state()
-                return True
-
-        if visualizer:
-            visualizer.capture_state()
-
-        print(f"Failed to reach goal in {self.max_steps} steps.")
-        return False
-    
-    
     def select_action(self, available_actions, num_modules):
         actions_to_take = {}
 
@@ -51,3 +22,19 @@ class RandomSearchAgent(Agent):
 
         return (module, actions[np.random.randint(len(actions))])
 
+    def search(self, ogm: OGMEnv):
+
+        while self.steps_taken < self.max_steps:
+            possible_actions = ogm.ogm.calc_possible_actions()
+            module, action = self.select_action(possible_actions, ogm.num_modules)
+            observation,reward,done,info  = ogm.step((module,action))
+            self.steps_taken += 1
+            if done:
+                if info["is_success"]:
+                    self.success = True
+                    print(f"Goal reached in {self.steps_taken} steps!")
+                    return True
+                break
+
+        print(f"Failed to reach goal in {self.steps_taken} steps.")
+        return False
