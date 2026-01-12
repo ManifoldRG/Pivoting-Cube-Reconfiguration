@@ -83,3 +83,96 @@ def four_band_reduction(D: torch.Tensor,
                 write_ptr[b] += kb
 
     return out
+
+
+def k_local_reduction_4k(
+    D: torch.Tensor,
+    num_agents: torch.Tensor,
+    k: int
+) -> torch.Tensor:
+    """
+    k-local neighborhood reduction with minimal (non-redundant) dimension = 4*k.
+
+    Parameters
+    ----------
+    D : torch.Tensor
+        Shape (B, M, M)
+        Batched pairwise distance matrices.
+
+    num_agents : torch.Tensor
+        Shape (B,) or (B,1)
+
+    k : int
+        Local window size (odd recommended).
+
+    Returns
+    -------
+    out : torch.Tensor
+        Shape (B, M, 4*k)
+
+        For each batch b and agent i:
+            out[b, i] is a vector of length 4*k containing
+            band-limited distances from the k-window centered at i,
+            packed contiguously and zero padded.
+    """
+
+    B, M, _ = D.shape
+    device = D.device
+    num_agents = num_agents.view(B).to(device)
+
+    r = k // 2
+    feat_dim = 4 * k
+
+    # Output tensor
+    out = torch.zeros(B, M, feat_dim, device=device)
+
+    # Iterate over agents
+    for i in range(M):
+
+        # Local window indices centered at i
+        window = torch.arange(i - r, i + r + 1, device=device)   # (k,)
+        window_len = window.numel()
+
+        # Clip for safe indexing
+        window = window.clamp(min=0, max=M - 1)
+
+        # Write pointer per batch for packing
+        write_ptr = torch.zeros(B, dtype=torch.long, device=device)
+
+        # For each local row p in the window
+        for t in range(window_len):
+            p = window[t]
+
+            # Neighbor candidates: second and first neighbors
+            nbrs = torch.tensor(
+                [p - 2, p - 1, p + 1, p + 2],
+                device=device
+            )                                                   # (4,)
+
+            # Valid neighbor mask per batch
+            valid = (
+                (nbrs.view(1, 4) >= 0) &
+                (nbrs.view(1, 4) < num_agents.view(B, 1))
+            )                                                   # (B,4)
+
+            # Clamp for safe gather
+            nbrs = nbrs.clamp(min=0, max=M - 1)
+
+            # Gather distances
+            vals = D[:, p, nbrs]                                # (B,4)
+            vals = vals * valid                                # mask invalid
+
+            # Number of valid values contributed by this row
+            k_local = valid.sum(dim=1)                          # (B,)
+
+            # Pack contiguously
+            for b in range(B):
+                kb = int(k_local[b].item())
+                if kb > 0:
+                    start = write_ptr[b]
+                    out[b, i, start : start + kb] = vals[b, :kb]
+                    write_ptr[b] += kb
+
+        # Remaining entries stay zero padded
+
+    return out

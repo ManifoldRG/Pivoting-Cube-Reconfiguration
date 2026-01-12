@@ -116,7 +116,7 @@ class CustomCallback(BaseCallback):
             )
 
 MIN_AGENTS = 5
-MAX_AGENTS = 5
+MAX_AGENTS = 7
 def train(args):
     """Main training loop using SB3."""
     setup_logging(args.log_dir)
@@ -172,8 +172,8 @@ def train(args):
         verbose=1,
         tensorboard_log=args.log_dir,
         policy_kwargs=dict(
-            features_extractor_class=FixedAgentsFeatureExtractor,
-            features_extractor_kwargs=dict(num_agents=MEAN_AGENTS),
+            features_extractor_class=RecurrentFeatureExtractor,
+            features_extractor_kwargs=dict(k=3,embedded_dim=256,agent_id_dim=128),
             net_arch=[args.hidden_dim, args.hidden_dim]
         )
     )
