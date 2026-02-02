@@ -74,7 +74,7 @@ class ActorCritic(nn.Module):
         self,
         x: chex.Array,
         action_mask: Optional[chex.Array] = None
-    ) -> Tuple[Categorical, chex.Array]:
+    ) -> Tuple[chex.Array, chex.Array]:
         # Shared trunk (optional - set to empty for separate networks)
         
         # Actor network
@@ -88,9 +88,6 @@ class ActorCritic(nn.Module):
         if action_mask is not None:
             logits = jnp.where(action_mask, logits, -1e10)
         
-        # Create distribution (using our pure JAX implementation)
-        pi = Categorical(logits=logits)
-        
         # Critic network (separate)
         critic = x
         for dim in self.hidden_dims:
@@ -98,7 +95,7 @@ class ActorCritic(nn.Module):
             critic = nn.relu(critic)
         value = nn.Dense(1)(critic)
         
-        return pi, jnp.squeeze(value, axis=-1)
+        return logits, jnp.squeeze(value, axis=-1)
 
 
 # ============================================
@@ -211,7 +208,8 @@ def make_ppo_update(
         
         def loss_fn(params):
             # Forward pass
-            pi, value = network.apply(params, batch.obs, batch.action_mask)
+            logits, value = network.apply(params, batch.obs, batch.action_mask)
+            pi = Categorical(logits)
             
             # Policy loss
             log_prob = pi.log_prob(batch.action)
@@ -401,7 +399,8 @@ def make_rollout_fn(
             action_mask = env.get_action_mask(env_state, agent_idx)
             
             # Forward pass
-            pi, value = network.apply(train_state.params, obs[None], action_mask[None])
+            logits, value = network.apply(train_state.params, obs[None], action_mask[None])
+            pi = Categorical(logits)
             
             # Sample action
             action = pi.sample(seed=action_key)[0]

@@ -29,6 +29,7 @@ from train_jax.ppo_jax import (
     make_ppo_update,
     make_rollout_fn,
     Transition,
+    Categorical,
 )
 
 
@@ -298,19 +299,22 @@ def train_stage(
             action_masks = jax.vmap(env.get_action_mask)(env_states, agent_indices)
             
             # Forward pass for all envs
-            pis, values = jax.vmap(
+            logits, values = jax.vmap(
                 lambda o, m: network.apply(train_state.params, o[None], m[None])
             )(obs_batch, action_masks)
             
             # Need to squeeze the batch dim added above
+            # Shape of logits: (n_envs, 1, 49) -> (n_envs, 49)
+            logits = logits[:, 0]
             values = values[:, 0]
+            
+            # Create distribution
+            pis = Categorical(logits)
             
             # Sample actions
             action_keys = jax.random.split(action_key, n_envs)
             actions = jax.vmap(lambda pi, k: pi.sample(seed=k))(pis, action_keys)
-            actions = actions[:, 0]  # Remove extra dim
             log_probs = jax.vmap(lambda pi, a: pi.log_prob(a))(pis, actions)
-            log_probs = log_probs[:, 0]
             
             # Step all environments
             next_obs, env_states, rewards, dones, infos = vectorized_step(

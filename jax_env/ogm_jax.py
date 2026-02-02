@@ -158,7 +158,7 @@ def calc_four_band_reduction(pairwise_norms: chex.Array) -> chex.Array:
     return jnp.stack(bands, axis=1)  # (n, 4)
 
 
-@jax.jit
+@partial(jax.jit, static_argnums=(2,))
 def calc_local_neighborhood(
     reduced_norms: chex.Array,
     agent_idx: int,
@@ -278,29 +278,19 @@ def get_action_mask(
         (49,) boolean mask of valid actions
     """
     positions = state.module_positions
-    n = state.n
     
-    # Start with all actions invalid
-    mask = jnp.zeros(NUM_ACTIONS, dtype=jnp.bool_)
-    
-    # No-op is always valid
-    mask = mask.at[48].set(True)
-    
-    # Check each pivot action
+    # Check each pivot action using JAX-compatible logic
     def check_action(action_idx: int) -> bool:
-        if action_idx >= 48:
-            return True  # No-op
-            
         delta = get_action_deltas()[action_idx]
         new_pos = positions[agent_idx] + delta
         
-        # Check 1: Position not already occupied
+        # Check: Position not already occupied
         occupied = jnp.any(jnp.all(positions == new_pos, axis=1))
         
-        # Check 2: Would remain connected (simplified check)
-        # For full check, would need to verify pivot zone
-        
-        return ~occupied
+        # Valid if within pivot actions (0-47) and not occupied
+        # Action 48 (no-op) is always valid
+        is_noop = action_idx >= 48
+        return is_noop | (~occupied)
     
     mask = jax.vmap(check_action)(jnp.arange(NUM_ACTIONS))
     
@@ -452,6 +442,8 @@ def make_connected_configuration(
     """
     Generate a random connected configuration of n modules.
     
+    This implementation is JAX-traceable by using static shapes and masking.
+    
     Args:
         key: JAX random key
         n: Number of modules
@@ -460,47 +452,66 @@ def make_connected_configuration(
     Returns:
         (n, 3) array of positions
     """
-    # Start with one module at center
     center = grid_size // 2
-    positions = jnp.array([[center, center, center]], dtype=jnp.int32)
     
-    # Add modules one at a time, adjacent to existing ones
-    def add_module(carry, key):
-        positions, count = carry
-        
-        # Get all possible neighbor positions
-        def get_neighbors_of(idx):
-            pos = positions[idx]
-            deltas = jnp.array([[1,0,0], [-1,0,0], [0,1,0], [0,-1,0], [0,0,1], [0,0,-1]])
-            return pos + deltas
-        
-        # Collect all neighbor positions
-        all_neighbors = jax.vmap(get_neighbors_of)(jnp.arange(count))
-        all_neighbors = all_neighbors.reshape(-1, 3)
-        
-        # Filter out occupied positions
-        def is_free(pos):
-            return ~jnp.any(jnp.all(positions[:count] == pos, axis=1))
-        
-        free_mask = jax.vmap(is_free)(all_neighbors)
-        
-        # Select random free position
-        probs = free_mask.astype(jnp.float32)
-        probs = probs / (probs.sum() + 1e-8)
-        idx = jax.random.choice(key, jnp.arange(len(all_neighbors)), p=probs)
-        new_pos = all_neighbors[idx]
-        
-        # Add to positions
-        positions = positions.at[count].set(new_pos)
-        
-        return (positions, count + 1), None
-    
-    # Pre-allocate space
+    # Pre-allocate positions array
     positions = jnp.zeros((n, 3), dtype=jnp.int32)
     positions = positions.at[0].set(jnp.array([center, center, center]))
     
+    # Valid mask - which positions are filled
+    valid_mask = jnp.zeros(n, dtype=jnp.bool_)
+    valid_mask = valid_mask.at[0].set(True)
+    
+    # 6 possible neighbor directions
+    DELTAS = jnp.array([
+        [1, 0, 0], [-1, 0, 0],
+        [0, 1, 0], [0, -1, 0],
+        [0, 0, 1], [0, 0, -1]
+    ], dtype=jnp.int32)
+    
+    def add_module(carry, key):
+        positions, valid_mask, count = carry
+        
+        # For each existing position, compute all 6 neighbors
+        # Shape: (n, 6, 3)
+        all_neighbors = positions[:, None, :] + DELTAS[None, :, :]
+        
+        # Flatten to (n * 6, 3)
+        all_neighbors_flat = all_neighbors.reshape(-1, 3)
+        
+        # Create mask for which neighbor slots are valid (from filled positions)
+        # Shape: (n, 6) -> (n * 6,)
+        from_valid = jnp.repeat(valid_mask, 6)
+        
+        # Check which positions are NOT already occupied
+        def is_free(pos):
+            # Check against all positions (using valid_mask to ignore empty slots)
+            matches = jnp.all(positions == pos, axis=1) & valid_mask
+            return ~jnp.any(matches)
+        
+        free_mask = jax.vmap(is_free)(all_neighbors_flat)
+        
+        # Combined mask: from valid position AND the target is free
+        candidate_mask = from_valid & free_mask
+        
+        # Create probability distribution (uniform over valid candidates)
+        probs = candidate_mask.astype(jnp.float32)
+        probs = probs / (probs.sum() + 1e-8)
+        
+        # Sample a position
+        num_candidates = n * 6
+        idx = jax.random.choice(key, num_candidates, p=probs)
+        new_pos = all_neighbors_flat[idx]
+        
+        # Add to positions at the current count
+        positions = positions.at[count].set(new_pos)
+        valid_mask = valid_mask.at[count].set(True)
+        
+        return (positions, valid_mask, count + 1), None
+    
+    # Run scan to add n-1 modules
     keys = jax.random.split(key, n - 1)
-    (positions, _), _ = lax.scan(add_module, (positions, 1), keys)
+    (positions, _, _), _ = lax.scan(add_module, (positions, valid_mask, 1), keys)
     
     return positions
 
