@@ -53,7 +53,11 @@ class OGMConfig(NamedTuple):
 
 # Pre-computed action deltas for all 48 pivot moves
 # Shape: (48, 3) - displacement in x, y, z for each action
-ACTION_DELTAS = jnp.array([
+# NOTE: Using numpy array at module level to avoid JAX initialization at import time
+# This is converted to JAX array lazily when first used
+import numpy as np
+
+_ACTION_DELTAS_NP = np.array([
     # X-axis pivots (16 actions)
     [-1, -1, -1], [-1, -1, 0], [-1, -1, 1], [-1, 0, -1],
     [-1, 0, 1], [-1, 1, -1], [-1, 1, 0], [-1, 1, 1],
@@ -69,9 +73,19 @@ ACTION_DELTAS = jnp.array([
     [-1, 0, 1], [-1, 1, -1], [-1, 1, 0], [-1, 1, 1],
     [1, -1, -1], [1, -1, 0], [1, -1, 1], [1, 0, -1],
     [1, 0, 1], [1, 1, -1], [1, 1, 0], [1, 1, 1],
-], dtype=jnp.int32)
+], dtype=np.int32)
 
 NUM_ACTIONS = 49  # 48 pivot + 1 no-op
+
+# Lazy initialization of JAX array
+_ACTION_DELTAS_JAX = None
+
+def get_action_deltas():
+    """Get ACTION_DELTAS as a JAX array (lazy initialization)."""
+    global _ACTION_DELTAS_JAX
+    if _ACTION_DELTAS_JAX is None:
+        _ACTION_DELTAS_JAX = jnp.array(_ACTION_DELTAS_NP)
+    return _ACTION_DELTAS_JAX
 
 
 # ============================================
@@ -277,7 +291,7 @@ def get_action_mask(
         if action_idx >= 48:
             return True  # No-op
             
-        delta = ACTION_DELTAS[action_idx]
+        delta = get_action_deltas()[action_idx]
         new_pos = positions[agent_idx] + delta
         
         # Check 1: Position not already occupied
@@ -319,7 +333,7 @@ def step(
     # Apply action
     new_positions = lax.cond(
         action < 48,
-        lambda: positions.at[agent_idx].add(ACTION_DELTAS[action]),
+        lambda: positions.at[agent_idx].add(get_action_deltas()[action]),
         lambda: positions
     )
     

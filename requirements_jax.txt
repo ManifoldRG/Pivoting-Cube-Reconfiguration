@@ -8,7 +8,8 @@ jaxlib>=0.4.20
 # Neural network libraries
 flax>=0.7.0
 optax>=0.1.7
-distrax>=0.1.4
+# Note: distrax removed - using pure JAX categorical implementation
+# to avoid version conflicts with newer JAX
 
 # Core
 numpy>=1.24.0

@@ -17,7 +17,44 @@ import chex
 import flax.linen as nn
 from flax.training.train_state import TrainState
 import optax
-import distrax
+
+
+# ============================================
+# Pure JAX Categorical Distribution
+# (Replaces distrax to avoid version conflicts)
+# ============================================
+
+class Categorical:
+    """
+    Pure JAX implementation of Categorical distribution.
+    Compatible with newer JAX versions (0.5+).
+    """
+    
+    def __init__(self, logits: chex.Array):
+        self.logits = logits
+        self._probs = None
+    
+    @property
+    def probs(self) -> chex.Array:
+        if self._probs is None:
+            self._probs = jax.nn.softmax(self.logits, axis=-1)
+        return self._probs
+    
+    def sample(self, seed: chex.PRNGKey) -> chex.Array:
+        """Sample from the distribution."""
+        return jax.random.categorical(seed, self.logits, axis=-1)
+    
+    def log_prob(self, value: chex.Array) -> chex.Array:
+        """Compute log probability of value."""
+        # Normalize logits for numerical stability
+        log_probs = jax.nn.log_softmax(self.logits, axis=-1)
+        # Index into log_probs at the given value
+        return jnp.take_along_axis(log_probs, value[..., None], axis=-1).squeeze(-1)
+    
+    def entropy(self) -> chex.Array:
+        """Compute entropy of the distribution."""
+        log_probs = jax.nn.log_softmax(self.logits, axis=-1)
+        return -jnp.sum(self.probs * log_probs, axis=-1)
 
 
 # ============================================
@@ -37,7 +74,7 @@ class ActorCritic(nn.Module):
         self,
         x: chex.Array,
         action_mask: Optional[chex.Array] = None
-    ) -> Tuple[distrax.Distribution, chex.Array]:
+    ) -> Tuple[Categorical, chex.Array]:
         # Shared trunk (optional - set to empty for separate networks)
         
         # Actor network
@@ -51,8 +88,8 @@ class ActorCritic(nn.Module):
         if action_mask is not None:
             logits = jnp.where(action_mask, logits, -1e10)
         
-        # Create distribution
-        pi = distrax.Categorical(logits=logits)
+        # Create distribution (using our pure JAX implementation)
+        pi = Categorical(logits=logits)
         
         # Critic network (separate)
         critic = x
