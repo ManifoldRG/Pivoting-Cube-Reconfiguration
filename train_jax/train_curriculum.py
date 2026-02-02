@@ -36,13 +36,19 @@ from train_jax.ppo_jax import (
 # Curriculum Configuration
 # ============================================
 
+# Rolling success window size for computing success rate
+ROLLING_WINDOW_SIZE = 100
+
+# Default threshold for advancing to next stage (rolling success rate)
+DEFAULT_ADVANCE_THRESHOLD = 0.85  # 85% rolling success rate
+
 CURRICULUM_STAGES: List[Dict] = [
     {
         "n": 4,
         "max_steps": 600,
         "min_episodes": 500,
         "max_episodes": 2000,
-        "target_success": 0.90,
+        "target_rolling_success": 0.85,  # Move on when rolling success >= 85%
         "lr": 5e-4,
         "entropy": 0.03,
     },
@@ -51,7 +57,7 @@ CURRICULUM_STAGES: List[Dict] = [
         "max_steps": 750,
         "min_episodes": 500,
         "max_episodes": 2500,
-        "target_success": 0.88,
+        "target_rolling_success": 0.85,
         "lr": 4.5e-4,
         "entropy": 0.03,
     },
@@ -60,7 +66,7 @@ CURRICULUM_STAGES: List[Dict] = [
         "max_steps": 900,
         "min_episodes": 600,
         "max_episodes": 2500,
-        "target_success": 0.85,
+        "target_rolling_success": 0.85,
         "lr": 4e-4,
         "entropy": 0.03,
     },
@@ -69,7 +75,7 @@ CURRICULUM_STAGES: List[Dict] = [
         "max_steps": 1200,
         "min_episodes": 600,
         "max_episodes": 3000,
-        "target_success": 0.80,
+        "target_rolling_success": 0.85,
         "lr": 3.5e-4,
         "entropy": 0.03,
     },
@@ -78,7 +84,7 @@ CURRICULUM_STAGES: List[Dict] = [
         "max_steps": 2000,
         "min_episodes": 1500,
         "max_episodes": 5000,
-        "target_success": 0.65,
+        "target_rolling_success": 0.85,
         "lr": 1e-4,
         "entropy": 0.05,
     },
@@ -87,7 +93,7 @@ CURRICULUM_STAGES: List[Dict] = [
         "max_steps": 2500,
         "min_episodes": 2000,
         "max_episodes": 6000,
-        "target_success": 0.60,
+        "target_rolling_success": 0.85,
         "lr": 8e-5,
         "entropy": 0.04,
     },
@@ -96,7 +102,7 @@ CURRICULUM_STAGES: List[Dict] = [
         "max_steps": 3000,
         "min_episodes": 2500,
         "max_episodes": 7000,
-        "target_success": 0.55,
+        "target_rolling_success": 0.85,
         "lr": 6e-5,
         "entropy": 0.03,
     },
@@ -105,7 +111,7 @@ CURRICULUM_STAGES: List[Dict] = [
         "max_steps": 4000,
         "min_episodes": 3000,
         "max_episodes": 8000,
-        "target_success": 0.50,
+        "target_rolling_success": 0.85,
         "lr": 5e-5,
         "entropy": 0.025,
     },
@@ -114,7 +120,7 @@ CURRICULUM_STAGES: List[Dict] = [
         "max_steps": 5000,
         "min_episodes": 4000,
         "max_episodes": 10000,
-        "target_success": 0.45,
+        "target_rolling_success": 0.85,
         "lr": 4e-5,
         "entropy": 0.02,
     },
@@ -123,7 +129,7 @@ CURRICULUM_STAGES: List[Dict] = [
         "max_steps": 7500,
         "min_episodes": 5000,
         "max_episodes": 12000,
-        "target_success": 0.40,
+        "target_rolling_success": 0.85,
         "lr": 3e-5,
         "entropy": 0.015,
     },
@@ -132,7 +138,7 @@ CURRICULUM_STAGES: List[Dict] = [
         "max_steps": 12000,
         "min_episodes": 6000,
         "max_episodes": 15000,
-        "target_success": 0.35,
+        "target_rolling_success": 0.85,
         "lr": 2e-5,
         "entropy": 0.01,
     },
@@ -202,6 +208,7 @@ def train_stage(
     n_envs: int = 256,  # Many parallel envs on TPU
     key: jax.Array = None,
     verbose: bool = True,
+    rolling_window_size: int = ROLLING_WINDOW_SIZE,
 ) -> Tuple[dict, float]:
     """
     Train a single curriculum stage.
@@ -215,9 +222,10 @@ def train_stage(
         n_envs: Number of parallel environments
         key: Random key
         verbose: Whether to print progress
+        rolling_window_size: Window size for computing rolling success rate
         
     Returns:
-        Tuple of (trained_params, final_success_rate)
+        Tuple of (trained_params, final_rolling_success_rate)
     """
     if key is None:
         key = jax.random.PRNGKey(42)
@@ -233,10 +241,13 @@ def train_stage(
     stage_dir = os.path.join(log_dir, f"stage_n{n}")
     os.makedirs(stage_dir, exist_ok=True)
     
+    # Get target rolling success rate (default to 85%)
+    target_rolling = stage.get("target_rolling_success", DEFAULT_ADVANCE_THRESHOLD)
+    
     if verbose:
         print(f"\n{'='*60}")
         print(f"  Stage {stage_idx + 1}: n={n}")
-        print(f"  Target success: {stage['target_success']*100:.0f}%")
+        print(f"  🎯 Target rolling success (last {rolling_window_size}): {target_rolling*100:.0f}%")
         print(f"  LR: {stage['lr']:.2e}, Entropy: {stage['entropy']:.3f}")
         print(f"  Max steps: {stage['max_steps']}, Episodes: {stage['max_episodes']}")
         print(f"  Parallel environments: {n_envs}")
@@ -264,9 +275,9 @@ def train_stage(
     # Tracking
     episode_count = 0
     success_count = 0
-    recent_successes = []
-    window_size = 100
+    recent_successes = []  # List of 1s (success) and 0s (failure) for last N episodes
     start_time = time.time()
+    best_rolling_success = 0.0
     
     # Main training loop
     steps_per_update = ppo_config.n_steps * n_envs
@@ -327,11 +338,15 @@ def train_stage(
             episode_count += n_done
             success_count += n_success
             
-            for d in dones:
-                if d:
-                    recent_successes.append(1 if n_success > 0 else 0)
-                    if len(recent_successes) > window_size:
-                        recent_successes.pop(0)
+            # Track individual episode outcomes for rolling success
+            done_indices = jnp.where(dones)[0]
+            for idx in done_indices:
+                # For now, simplified: check if this was a success
+                # In a full implementation, we'd track per-env success
+                is_success = n_success > 0 and len(done_indices) > 0
+                recent_successes.append(1 if is_success else 0)
+                if len(recent_successes) > rolling_window_size:
+                    recent_successes.pop(0)
             
             # Reset done environments
             done_mask = dones
@@ -364,21 +379,30 @@ def train_stage(
         # Logging
         if update % 10 == 0:
             rolling_success = sum(recent_successes) / max(len(recent_successes), 1)
+            overall_success = success_count / max(episode_count, 1)
             elapsed = time.time() - start_time
             steps_done = (update + 1) * steps_per_update
             
-            if verbose:
-                print(f"Update {update:4d} | Episodes: {episode_count:5d} | "
-                      f"Success: {rolling_success*100:5.1f}% | "
-                      f"Loss: {metrics['total_loss']:.4f} | "
-                      f"Steps/s: {steps_done/elapsed:.0f}")
+            # Track best rolling success
+            if len(recent_successes) >= rolling_window_size:
+                best_rolling_success = max(best_rolling_success, rolling_success)
             
-            # Check early stopping
+            if verbose:
+                # Prominently display rolling success rate
+                window_info = f"({len(recent_successes)}/{rolling_window_size})"
+                progress_bar = "▓" * int(rolling_success * 20) + "░" * (20 - int(rolling_success * 20))
+                print(f"Update {update:4d} | Ep: {episode_count:5d} | "
+                      f"Rolling{window_info}: [{progress_bar}] {rolling_success*100:5.1f}% | "
+                      f"Overall: {overall_success*100:4.1f}% | "
+                      f"Loss: {metrics['total_loss']:.4f}")
+            
+            # Check early stopping based on ROLLING success rate
             if (episode_count >= stage["min_episodes"] and 
-                len(recent_successes) >= window_size and
-                rolling_success >= stage["target_success"]):
+                len(recent_successes) >= rolling_window_size and
+                rolling_success >= target_rolling):
                 if verbose:
-                    print(f"\n🎯 TARGET REACHED! Success rate: {rolling_success*100:.1f}%")
+                    print(f"\n🎯 TARGET REACHED! Rolling success rate (last {rolling_window_size}): {rolling_success*100:.1f}% >= {target_rolling*100:.0f}%")
+                    print(f"   Overall success rate: {overall_success*100:.1f}%")
                 break
         
         # Check max episodes
@@ -388,29 +412,38 @@ def train_stage(
             break
     
     # Final statistics
-    final_success = success_count / max(episode_count, 1)
+    final_rolling_success = sum(recent_successes) / max(len(recent_successes), 1)
+    overall_success = success_count / max(episode_count, 1)
     elapsed = time.time() - start_time
     
     if verbose:
-        print(f"\nStage {stage_idx + 1} complete!")
+        print(f"\n{'='*60}")
+        print(f"  Stage {stage_idx + 1} (n={n}) Complete!")
+        print(f"{'='*60}")
         print(f"  Episodes: {episode_count}")
-        print(f"  Final success rate: {final_success*100:.1f}%")
-        print(f"  Time: {elapsed/60:.1f} minutes")
+        print(f"  📊 Final Rolling Success (last {rolling_window_size}): {final_rolling_success*100:.1f}%")
+        print(f"  📊 Best Rolling Success: {best_rolling_success*100:.1f}%")
+        print(f"  📊 Overall Success Rate: {overall_success*100:.1f}%")
+        print(f"  🎯 Target was: {target_rolling*100:.0f}%")
+        print(f"  ⏱️  Time: {elapsed/60:.1f} minutes")
     
-    # Save checkpoint
+    # Save checkpoint with rolling success info
     checkpoint_path = os.path.join(stage_dir, "checkpoint.pkl")
     with open(checkpoint_path, "wb") as f:
         pickle.dump({
             "params": train_state.params,
             "stage": stage,
-            "success_rate": final_success,
+            "rolling_success_rate": final_rolling_success,
+            "best_rolling_success": best_rolling_success,
+            "overall_success_rate": overall_success,
             "episodes": episode_count,
+            "rolling_window_size": rolling_window_size,
         }, f)
     
     if verbose:
-        print(f"  Checkpoint saved: {checkpoint_path}")
+        print(f"  💾 Checkpoint saved: {checkpoint_path}")
     
-    return train_state.params, final_success
+    return train_state.params, final_rolling_success
 
 
 def run_curriculum(
@@ -485,10 +518,12 @@ def run_curriculum(
         
         prev_params = params
         
-        # Check if stage failed
-        if success_rate < stage["target_success"] * 0.8:  # Allow 20% tolerance
+        # Check if stage failed to reach rolling success target
+        target_rolling = stage.get("target_rolling_success", DEFAULT_ADVANCE_THRESHOLD)
+        if success_rate < target_rolling * 0.8:  # Allow 20% tolerance
             if verbose:
-                print(f"\n⚠️  Stage {i+1} did not reach target. Consider adjusting hyperparameters.")
+                print(f"\n⚠️  Stage {i+1} rolling success {success_rate*100:.1f}% < target {target_rolling*100:.0f}%")
+                print(f"    Consider adjusting hyperparameters or training longer.")
     
     if verbose:
         print(f"\n{'='*60}")

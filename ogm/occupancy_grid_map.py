@@ -1,838 +1,1418 @@
 import numpy as np
 from numpy.linalg import norm
 from collections import deque
-from munkres import Munkres
+from scipy.optimize import linear_sum_assignment
+
 
 class OccupancyGridMap:
-  def __init__(self, module_positions, final_module_positions, n):
-    """Initialize the occupancy grid map with module positions.
-    
-    Args:
-        module_positions: Dictionary mapping module numbers to their positions (x,y,z)
-        final_module_positions: Dictionary mapping module numbers to their goal positions (x,y,z)
-        n: Number of modules
-    """
-    # Validate inputs
-    if not module_positions or not final_module_positions:
-        raise ValueError("Module positions dictionaries cannot be empty")
-    if n <= 0:
-        raise ValueError("Number of modules must be positive")
-    
-    self.m = Munkres()
-    # Store original module positions before recentering
-    self.original_module_positions = module_positions.copy()
-    self.original_final_module_positions = final_module_positions.copy()
-    
-    # Calculate grid size based on number of modules
-    grid_size = self.calculate_grid_size(n)
-    
-    # Create grid maps with appropriate size
-    self.grid_map = np.zeros((grid_size, grid_size, grid_size))
-    self.curr_grid_map = np.zeros((grid_size, grid_size, grid_size))
-    self.pre_action_grid_map = np.zeros((grid_size, grid_size, grid_size)) # this will store the grid map as it is before the action step begins
-    self.final_grid_map = np.zeros((grid_size, grid_size, grid_size))
-    self.pivot_zone_grid_map = np.full((grid_size, grid_size, grid_size), True)
-    
-    # Recenter module positions so that module 1 is at the center of the grid
-    self.module_positions, self.final_module_positions = self.recenter_initial_positions(
-        module_positions, final_module_positions, grid_size)
-    
+    def __init__(self, module_positions, final_module_positions, n):
+        """Initialize the occupancy grid map with module positions.
 
-    # Initialize grid maps with recentered module positions
-    for module, pos in self.module_positions.items():
-        self.grid_map[pos[0], pos[1], pos[2]] = module
-        self.curr_grid_map[pos[0], pos[1], pos[2]] = module
-    
-    for module, pos in self.final_module_positions.items():
-        self.final_grid_map[pos[0], pos[1], pos[2]] = module
-    
-    # Set reference position for recentering during operations
-    self.recenter_to = self.module_positions[1]
-    self.modules = range(1, n+1)
-    self.edges = self.calculate_edges(self.modules, self.module_positions)
-    # Pre-compute pairwise norms for final configuration and current
-    # configuration; `curr_pairwise_norms` is stored as a difference to the
-    # final configuration so that a zero matrix corresponds to success.
-    self.final_pairwise_norms = self.calc_pairwise_norms(self.final_module_positions)
-    mat1 = self.calc_pairwise_norms(self.module_positions)
-    self.curr_pairwise_norms = mat1 - self.calc_current_v_reassigned_final(mat1, self.final_pairwise_norms)
-    #self.pre_action_edges = self.edges.copy()
-    self.init_actions()
-    self.calc_pre_action_grid_map()
+        Args:
+            module_positions: Dictionary mapping module numbers to their positions (x,y,z)
+            final_module_positions: Dictionary mapping module numbers to their goal positions (x,y,z)
+            n: Number of modules
+        """
+        # Validate inputs
+        if not module_positions or not final_module_positions:
+            raise ValueError("Module positions dictionaries cannot be empty")
+        if n <= 0:
+            raise ValueError("Number of modules must be positive")
 
-  def calculate_grid_size(self, n):
-    """Calculate grid size based on number of modules.
-    
-    Args:
-        n: Number of modules
-        
-    Returns:
-        Grid size (same for all dimensions)
-    """
-    # Ensure minimum grid size of 5x5x5
-    # For larger module counts, use a formula that scales with module count
-    # Using n*2+3 as a simple scaling formula
-    return max(5, n*2+3)
-  
-  def recenter_initial_positions(self, module_positions, final_module_positions, grid_size):
-    """Recenter module positions so that module 1 is at the center of the grid.
-    
-    Args:
-        module_positions: Original module positions dictionary
-        final_module_positions: Original final module positions dictionary
-        grid_size: Size of the grid
-        
-    Returns:
-        Tuple of (recentered module positions, recentered final module positions)
-    """
-    # Calculate center of the grid
-    grid_center = grid_size // 2
-    
-    # Get position of module 1
-    if 1 not in module_positions:
-        raise ValueError("Module 1 must exist in the module positions dictionary")
-    
-    module1_pos = module_positions[1]
-    module1_final_pos = final_module_positions[1]
-    
-    # Calculate offset to move module 1 to grid center
-    offset = (
-        grid_center - module1_pos[0],
-        grid_center - module1_pos[1],
-        grid_center - module1_pos[2]
-    )
-    
-    # Apply offset to all module positions
-    recentered_positions = {}
-    for module, pos in module_positions.items():
-        recentered_positions[module] = (
-            pos[0] + offset[0],
-            pos[1] + offset[1],
-            pos[2] + offset[2]
+        # Store original module positions before recentering
+        self.original_module_positions = module_positions.copy()
+        self.original_final_module_positions = final_module_positions.copy()
+
+        # Cache for Hungarian assignment (avoid recomputing every step)
+        self._cached_assignment = None
+        self._cache_step_counter = 0
+        self._cache_update_interval = 10  # Recompute assignment every N actions
+
+        # Calculate grid size based on number of modules
+        grid_size = self.calculate_grid_size(n)
+
+        # Create grid maps with appropriate size
+        self.grid_map = np.zeros((grid_size, grid_size, grid_size))
+        self.curr_grid_map = np.zeros((grid_size, grid_size, grid_size))
+        self.pre_action_grid_map = np.zeros(
+            (grid_size, grid_size, grid_size)
+        )  # this will store the grid map as it is before the action step begins
+        self.final_grid_map = np.zeros((grid_size, grid_size, grid_size))
+        self.pivot_zone_grid_map = np.full((grid_size, grid_size, grid_size), True)
+
+        # Recenter module positions so that module 1 is at the center of the grid
+        self.module_positions, self.final_module_positions = (
+            self.recenter_initial_positions(
+                module_positions, final_module_positions, grid_size
+            )
         )
-    
-    # Calculate the "final" offset to move module 1 to grid center (in the case that module 1's final position deviates from its initial position)
-    final_offset = (
-        grid_center - module1_final_pos[0],
-        grid_center - module1_final_pos[1],
-        grid_center - module1_final_pos[2]
-    )
 
-    # Apply offset to all final module positions
-    recentered_final_positions = {}
-    for module, pos in final_module_positions.items():
-        recentered_final_positions[module] = (
-            pos[0] + final_offset[0],
-            pos[1] + final_offset[1],
-            pos[2] + final_offset[2]
+        # Initialize grid maps with recentered module positions
+        for module, pos in self.module_positions.items():
+            self.grid_map[pos[0], pos[1], pos[2]] = module
+            self.curr_grid_map[pos[0], pos[1], pos[2]] = module
+
+        for module, pos in self.final_module_positions.items():
+            self.final_grid_map[pos[0], pos[1], pos[2]] = module
+
+        # Set reference position for recentering during operations
+        self.recenter_to = self.module_positions[1]
+        self.modules = range(1, n + 1)
+        self.edges = self.calculate_edges(self.modules, self.module_positions)
+        # Pre-compute pairwise norms for final configuration and current
+        # configuration; `curr_pairwise_norms` is stored as a difference to the
+        # final configuration so that a zero matrix corresponds to success.
+        self.final_pairwise_norms = self.calc_pairwise_norms(
+            self.final_module_positions
         )
-    
-    return recentered_positions, recentered_final_positions
+        mat1 = self.calc_pairwise_norms(self.module_positions)
+        self.curr_pairwise_norms = mat1 - self.calc_current_v_reassigned_final(
+            mat1, self.final_pairwise_norms
+        )
+        # self.pre_action_edges = self.edges.copy()
+        self.init_actions()
+        self.calc_pre_action_grid_map()
 
-  # recenter the grid_map so that a module (the first one for now) is at (0,0,0)
-  def recenter(self):
-    # recenter to a position (NOT the origin)
-    curr_pos = self.module_positions[1]
-    offset = (curr_pos[0] - self.recenter_to[0], curr_pos[1] - self.recenter_to[1], curr_pos[2] - self.recenter_to[2])
-    self.curr_grid_map = np.zeros(self.curr_grid_map.shape)
+    def calculate_grid_size(self, n):
+        """Calculate grid size based on number of modules.
 
-    for module in self.modules:
-      temp_mod = self.module_positions[module]
-      new_pos = (temp_mod[0] - offset[0], temp_mod[1] - offset[1], temp_mod[2] - offset[2])
-      self.module_positions[module] = new_pos
-      self.curr_grid_map[new_pos[0], new_pos[1], new_pos[2]] = module
+        Args:
+            n: Number of modules
 
-    # Maintain `curr_pairwise_norms` as (current - final) so that zero means
-    # the structure matches the goal in pairwise-norm space.
-    mat1 = self.calc_pairwise_norms(self.module_positions)
-    self.curr_pairwise_norms = mat1 - self.calc_current_v_reassigned_final(mat1, self.final_pairwise_norms)
+        Returns:
+            Grid size (same for all dimensions)
+        """
+        # Ensure minimum grid size of 5x5x5
+        # For larger module counts, use a formula that scales with module count
+        # Using n*2+3 as a simple scaling formula
+        return max(5, n * 2 + 3)
 
-  # probably need each module to track its own position so that they can be easily recentered
+    def recenter_initial_positions(
+        self, module_positions, final_module_positions, grid_size
+    ):
+        """Recenter module positions so that module 1 is at the center of the grid.
 
-  # define possible actions in terms of a dictionary of a list of vectors from module to other necessary modules and a list of vectors from module to necessary empty spaces for keys, and values are vectors where the module ends up.
-  # actually use the slices as in the problem formulation. possible_actions is a dictionary with modules as keys and a 48 boolean long list as values.
-  def init_actions(self):
-    self.potential_pivots = {1: np.array([[True, True, False], [True, False, False]]), #fixed
-                             2: np.array([[True, True, False], [False, False, False], [False, False, False]]), #fixed
-                             3: np.array([[False, True, True], [False, False, True]]), #fixed
-                             4: np.array([[False, True, True], [False, False, False], [False, False, False]]), #fixed
-                             5: np.array([[False, False], [True, False], [True, True]]), #fixed
-                             6: np.array([[False, False, False], [True, False, False], [True, False, False]]), #fixed
-                             7: np.array([[False, False], [False, True], [True, True]]), #fixed
-                             8: np.array([[False, False, False], [False, False, True], [False, False, True]]), #fixed
-                             9: np.array([[True, False, False], [True, True, False]]), #fixed
-                             10: np.array([[False, False, False], [False, False, False], [True, True, False]]), #fixed
-                             11: np.array([[False, False, True], [False, True, True]]), #fixed
-                             12: np.array([[False, False, False], [False, False, False], [False, True, True]]), #fixed
-                             13: np.array([[True, True], [True, False], [False, False]]), #fixed
-                             14: np.array([[True, False, False], [True, False, False], [False, False, False]]), #fixed
-                             15: np.array([[True, True], [False, True], [False, False]]), #fixed
-                             16: np.array([[False, False, True], [False, False, True], [False, False, False]]), #fixed
-                             17: np.array([[True, True, False], [True, False, False]]), #fixed
-                             18: np.array([[True, True, False], [False, False, False], [False, False, False]]), #fixed
-                             19: np.array([[False, True, True], [False, False, True]]), #fixed
-                             20: np.array([[False, True, True], [False, False, False], [False, False, False]]), #fixed
-                             21: np.array([[False, False], [True, False], [True, True]]), #fixed
-                             22: np.array([[False, False, False], [True, False, False], [True, False, False]]), #fixed
-                             23: np.array([[False, False], [False, True], [True, True]]), #fixed
-                             24: np.array([[False, False, False], [False, False, True], [False, False, True]]), #fixed
-                             25: np.array([[True, False, False], [True, True, False]]), #fixed
-                             26: np.array([[False, False, False], [False, False, False], [True, True, False]]), #fixed
-                             27: np.array([[False, False, True], [False, True, True]]), #fixed
-                             28: np.array([[False, False, False], [False, False, False], [False, True, True]]), #fixed
-                             29: np.array([[True, True], [True, False], [False, False]]), #fixed
-                             30: np.array([[True, False, False], [True, False, False], [False, False, False]]), #fixed
-                             31: np.array([[True, True], [False, True], [False, False]]), #fixed
-                             32: np.array([[False, False, True], [False, False, True], [False, False, False]]), #fixed
-                             33: np.array([[True, True, False], [True, False, False]]), #fixed
-                             34: np.array([[True, True, False], [False, False, False], [False, False, False]]), #fixed
-                             35: np.array([[False, True, True], [False, False, True]]), #fixed
-                             36: np.array([[False, True, True], [False, False, False], [False, False, False]]), #fixed
-                             37: np.array([[False, False], [True, False], [True, True]]), #fixed
-                             38: np.array([[False, False, False], [True, False, False], [True, False, False]]), #fixed
-                             39: np.array([[False, False], [False, True], [True, True]]), #fixed
-                             40: np.array([[False, False, False], [False, False, True], [False, False, True]]), #fixed
-                             41: np.array([[True, False, False], [True, True, False]]), #fixed
-                             42: np.array([[False, False, False], [False, False, False], [True, True, False]]), #fixed
-                             43: np.array([[False, False, True], [False, True, True]]), #fixed
-                             44: np.array([[False, False, False], [False, False, False], [False, True, True]]), #fixed
-                             45: np.array([[True, True], [True, False], [False, False]]), #fixed
-                             46: np.array([[True, False, False], [True, False, False], [False, False, False]]), #fixed
-                             47: np.array([[True, True], [False, True], [False, False]]), #fixed
-                             48: np.array([[False, False, True], [False, False, True], [False, False, False]]) #fixed
-                             }
-    # true or false to represent no-pivot zones? False for consistency; True will represent free zones
-    self.free_zones = {1: np.array([[True, False, False], [True, False, False]]),
-                      2: np.array([[True, False, False], [False, False, False], [False, False, False]]),
-                      3: np.array([[False, False, True], [False, False, True]]),
-                      4: np.array([[False, False, True], [False, False, False], [False, False, False]]),
-                      5: np.array([[False, False], [False, False], [True, True]]),
-                      6: np.array([[False, False, False], [False, False, False], [True, False, False]]),
-                      7: np.array([[False, False], [False, False], [True, True]]),
-                      8: np.array([[False, False, False], [False, False, False], [False, False, True]]),
-                      9: np.array([[True, False, False], [True, False, False]]),
-                      10: np.array([[False, False, False], [False, False, False], [True, False, False]]),
-                      11: np.array([[False, False, True], [False, False, True]]),
-                      12: np.array([[False, False, False], [False, False, False], [False, False, True]]),
-                      13: np.array([[True, True], [False, False], [False, False]]),
-                      14: np.array([[True, False, False], [False, False, False], [False, False, False]]),
-                      15: np.array([[True, True], [False, False], [False, False]]),
-                      16: np.array([[False, False, True], [False, False, False], [False, False, False]]),
-                      17: np.array([[True, False, False], [True, False, False]]),
-                      18: np.array([[True, False, False], [False, False, False], [False, False, False]]),
-                      19: np.array([[False, False, True], [False, False, True]]),
-                      20: np.array([[False, False, True], [False, False, False], [False, False, False]]),
-                      21: np.array([[False, False], [False, False], [True, True]]),
-                      22: np.array([[False, False, False], [False, False, False], [True, False, False]]),
-                      23: np.array([[False, False], [False, False], [True, True]]),
-                      24: np.array([[False, False, False], [False, False, False], [False, False, True]]),
-                      25: np.array([[True, False, False], [True, False, False]]),
-                      26: np.array([[False, False, False], [False, False, False], [True, False, False]]),
-                      27: np.array([[False, False, True], [False, False, True]]),
-                      28: np.array([[False, False, False], [False, False, False], [False, False, True]]),
-                      29: np.array([[True, True], [False, False], [False, False]]),
-                      30: np.array([[True, False, False], [False, False, False], [False, False, False]]),
-                      31: np.array([[True, True], [False, False], [False, False]]),
-                      32: np.array([[False, False, True], [False, False, False], [False, False, False]]),
-                      33: np.array([[True, False, False], [True, False, False]]),
-                      34: np.array([[True, False, False], [False, False, False], [False, False, False]]),
-                      35: np.array([[False, False, True], [False, False, True]]),
-                      36: np.array([[False, False, True], [False, False, False], [False, False, False]]),
-                      37: np.array([[False, False], [False, False], [True, True]]),
-                      38: np.array([[False, False, False], [False, False, False], [True, False, False]]),
-                      39: np.array([[False, False], [False, False], [True, True]]),
-                      40: np.array([[False, False, False], [False, False, False], [False, False, True]]),
-                      41: np.array([[True, False, False], [True, False, False]]),
-                      42: np.array([[False, False, False], [False, False, False], [True, False, False]]),
-                      43: np.array([[False, False, True], [False, False, True]]),
-                      44: np.array([[False, False, False], [False, False, False], [False, False, True]]),
-                      45: np.array([[True, True], [False, False], [False, False]]),
-                      46: np.array([[True, False, False], [False, False, False], [False, False, False]]),
-                      47: np.array([[True, True], [False, False], [False, False]]),
-                      48: np.array([[False, False, True], [False, False, False], [False, False, False]])
-    }
+        Args:
+            module_positions: Original module positions dictionary
+            final_module_positions: Original final module positions dictionary
+            grid_size: Size of the grid
 
-    # 3 rows for x, y, z, respectively, with start, stop
-    self.ranges = {1: np.array([[0,1], [-1,1], [0,0]]),
-                   2: np.array([[0,2], [-1,1], [0,0]]),
-                   3: np.array([[0,1], [-1,1], [0,0]]),
-                   4: np.array([[0,2], [-1,1], [0,0]]),
-                   5: np.array([[-1,1], [0,1], [0,0]]),
-                   6: np.array([[-1,1], [0,2], [0,0]]),
-                   7: np.array([[-1,1], [-1,0], [0,0]]), # does the negative stuff work?
-                   8: np.array([[-1,1], [-2,0], [0,0]]), # does the negative stuff work?
-                   9: np.array([[-1,0], [-1,1], [0,0]]),
-                   10: np.array([[-2,0], [-1,1], [0,0]]),
-                   11: np.array([[-1,0], [-1,1], [0,0]]),
-                   12: np.array([[-2,0], [-1,1], [0,0]]),
-                   13: np.array([[-1,1], [0,1], [0,0]]),
-                   14: np.array([[-1,1], [0,2], [0,0]]),
-                   15: np.array([[-1,1], [-1,0], [0,0]]), # does the negative stuff work?
-                   16: np.array([[-1,1], [-2,0], [0,0]]), # does the negative stuff work? # now switch which dimension stays the same
-                   17: np.array([[0,1], [0,0], [-1,1]]),
-                   18: np.array([[0,2], [0,0], [-1,1]]),
-                   19: np.array([[0,1], [0,0], [-1,1]]),
-                   20: np.array([[0,2], [0,0], [-1,1]]),
-                   21: np.array([[-1,1], [0,0], [0,1]]),
-                   22: np.array([[-1,1], [0,0], [0,2]]),
-                   23: np.array([[-1,1], [0,0], [-1,0]]), # does the negative stuff work?
-                   24: np.array([[-1,1], [0,0], [-2,0]]), # does the negative stuff work?
-                   25: np.array([[-1,0], [0,0], [-1,1]]),
-                   26: np.array([[-2,0], [0,0], [-1,1]]),
-                   27: np.array([[-1,0], [0,0], [-1,1]]),
-                   28: np.array([[-2,0], [0,0], [-1,1]]),
-                   29: np.array([[-1,1], [0,0], [0,1]]),
-                   30: np.array([[-1,1], [0,0], [0,2]]),
-                   31: np.array([[-1,1], [0,0], [-1,0]]), # does the negative stuff work?
-                   32: np.array([[-1,1], [0,0], [-2,0]]), # does the negative stuff work? # now switch which dimension stays the same
-                   33: np.array([[0,0], [0,1], [-1,1]]),
-                   34: np.array([[0,0], [0,2], [-1,1]]),
-                   35: np.array([[0,0], [0,1], [-1,1]]),
-                   36: np.array([[0,0], [0,2], [-1,1]]),
-                   37: np.array([[0,0], [-1,1], [0,1]]),
-                   38: np.array([[0,0], [-1,1], [0,2]]),
-                   39: np.array([[0,0], [-1,1], [-1,0]]), # does the negative stuff work?
-                   40: np.array([[0,0], [-1,1], [-2,0]]), # does the negative stuff work?
-                   41: np.array([[0,0], [-1,0], [-1,1]]),
-                   42: np.array([[0,0], [-2,0], [-1,1]]),
-                   43: np.array([[0,0], [-1,0], [-1,1]]),
-                   44: np.array([[0,0], [-2,0], [-1,1]]),
-                   45: np.array([[0,0], [-1,1], [0,1]]),
-                   46: np.array([[0,0], [-1,1], [0,2]]),
-                   47: np.array([[0,0], [-1,1], [-1,0]]), # does the negative stuff work?
-                   48: np.array([[0,0], [-1,1], [-2,0]]) # does the negative stuff work? # now switch which dimension stays the same
-                   }
+        Returns:
+            Tuple of (recentered module positions, recentered final module positions)
+        """
+        # Calculate center of the grid
+        grid_center = grid_size // 2
 
-  # return the queue of randomized modules:
-  def calc_queue(self):
-    arr = np.arange(1, len(self.modules)+1)
-    np.random.shuffle(arr)
-    return arr
+        # Get position of module 1
+        if 1 not in module_positions:
+            raise ValueError("Module 1 must exist in the module positions dictionary")
 
-  def calc_possible_actions(self, module=None): # need to check now that neighbor is free
-    # need to add stuff to account for the pre_action_grid_map; need to have corresponding edges for the pre_action_grid_map
-    # what about module positions? Or maybe just calculate for a specific module???
-    # Do we ever require the full set of each module's actions? Don't we query each module individually? Does it matter?
-    self.possible_actions = {}
-    self.possible_pre_actions = {}
-    self.articulation_points = set(self.articulationPoints(len(self.modules), self.edges))
-    # print("articulation_points\n")
-    # print(self.articulation_points)
+        module1_pos = module_positions[1]
+        module1_final_pos = final_module_positions[1]
 
-    for m in self.modules:
-      #ipdb.set_trace()
-      self.possible_actions[m] = np.array(list(range(49))) >= 48
-      self.possible_pre_actions[m] = np.array(list(range(49))) >= 48
+        # Calculate offset to move module 1 to grid center
+        offset = (
+            grid_center - module1_pos[0],
+            grid_center - module1_pos[1],
+            grid_center - module1_pos[2],
+        )
 
-      if (module is None or m == module) and m not in self.articulation_points and m not in self.pre_action_articulation_points:
-        module_position = self.module_positions[m]
+        # Apply offset to all module positions
+        recentered_positions = {}
+        for module, pos in module_positions.items():
+            recentered_positions[module] = (
+                pos[0] + offset[0],
+                pos[1] + offset[1],
+                pos[2] + offset[2],
+            )
 
-        # will go to 48
-        for p in range(1, 49):
-          #ipdb.set_trace()
-          rangethingy = self.ranges[p]
-          offset_x = module_position[0] + rangethingy[0]
-          offset_y = module_position[1] + rangethingy[1]
-          offset_z = module_position[2] + rangethingy[2]
+        # Calculate the "final" offset to move module 1 to grid center (in the case that module 1's final position deviates from its initial position)
+        final_offset = (
+            grid_center - module1_final_pos[0],
+            grid_center - module1_final_pos[1],
+            grid_center - module1_final_pos[2],
+        )
 
-          sliced = self.curr_grid_map[offset_x[0]:(offset_x[1] + 1), offset_y[0]:(offset_y[1] + 1), offset_z[0]:(offset_z[1] + 1)]
-          pre_sliced = self.pre_action_grid_map[offset_x[0]:(offset_x[1] + 1), offset_y[0]:(offset_y[1] + 1), offset_z[0]:(offset_z[1] + 1)]
-          zone_slice = self.pivot_zone_grid_map[offset_x[0]:(offset_x[1] + 1), offset_y[0]:(offset_y[1] + 1), offset_z[0]:(offset_z[1] + 1)]
+        # Apply offset to all final module positions
+        recentered_final_positions = {}
+        for module, pos in final_module_positions.items():
+            recentered_final_positions[module] = (
+                pos[0] + final_offset[0],
+                pos[1] + final_offset[1],
+                pos[2] + final_offset[2],
+            )
 
-          booled = np.squeeze(sliced > 0)
-          pa = self.possible_actions[m]
-          pa[p - 1] = np.all(booled == self.potential_pivots[p]) and np.all(zone_slice)
-          self.possible_actions[m] = pa
+        return recentered_positions, recentered_final_positions
 
-          #pre_booled = np.squeeze(pre_sliced > 0)
-          #pre_pa = self.possible_pre_actions[m]
-          #pre_pa[p - 1] = np.all(pre_booled == self.potential_pivots[p]) 
-          #self.possible_pre_actions[m] = pre_pa
+    # recenter the grid_map so that a module (the first one for now) is at (0,0,0)
+    def recenter(self):
+        # recenter to a position (NOT the origin)
+        curr_pos = self.module_positions[1]
+        offset = (
+            curr_pos[0] - self.recenter_to[0],
+            curr_pos[1] - self.recenter_to[1],
+            curr_pos[2] - self.recenter_to[2],
+        )
+        self.curr_grid_map = np.zeros(self.curr_grid_map.shape)
 
-          # get rid of the pre_pa stuff and replace with pivot zones
-          #self.possible_actions[m] = pa & pre_pa 
+        for module in self.modules:
+            temp_mod = self.module_positions[module]
+            new_pos = (
+                temp_mod[0] - offset[0],
+                temp_mod[1] - offset[1],
+                temp_mod[2] - offset[2],
+            )
+            self.module_positions[module] = new_pos
+            self.curr_grid_map[new_pos[0], new_pos[1], new_pos[2]] = module
 
-          # will need to add ranges that will act as no-pivot zones; add to sets
-          # they'll be the offsets, will need a way to check intersections
-          # we can just add 4 to 9 tuple coordinates to the set
+        # Maintain `curr_pairwise_norms` as (current - final) so that zero means
+        # the structure matches the goal in pairwise-norm space.
+        mat1 = self.calc_pairwise_norms(self.module_positions)
+        self.curr_pairwise_norms = mat1 - self.calc_current_v_reassigned_final(
+            mat1, self.final_pairwise_norms
+        )
 
-          # OR we can create a mirror grid map that shows module numbers where pivots can't happen, and reference against that
-          # self.pivot_zone_grid_map
+    # probably need each module to track its own position so that they can be easily recentered
 
-    # for m in self.modules:
-    #   print(np.where(self.possible_actions[m])[0] + 1)
+    # define possible actions in terms of a dictionary of a list of vectors from module to other necessary modules and a list of vectors from module to necessary empty spaces for keys, and values are vectors where the module ends up.
+    # actually use the slices as in the problem formulation. possible_actions is a dictionary with modules as keys and a 48 boolean long list as values.
+    def init_actions(self):
+        self.potential_pivots = {
+            1: np.array([[True, True, False], [True, False, False]]),  # fixed
+            2: np.array(
+                [[True, True, False], [False, False, False], [False, False, False]]
+            ),  # fixed
+            3: np.array([[False, True, True], [False, False, True]]),  # fixed
+            4: np.array(
+                [[False, True, True], [False, False, False], [False, False, False]]
+            ),  # fixed
+            5: np.array([[False, False], [True, False], [True, True]]),  # fixed
+            6: np.array(
+                [[False, False, False], [True, False, False], [True, False, False]]
+            ),  # fixed
+            7: np.array([[False, False], [False, True], [True, True]]),  # fixed
+            8: np.array(
+                [[False, False, False], [False, False, True], [False, False, True]]
+            ),  # fixed
+            9: np.array([[True, False, False], [True, True, False]]),  # fixed
+            10: np.array(
+                [[False, False, False], [False, False, False], [True, True, False]]
+            ),  # fixed
+            11: np.array([[False, False, True], [False, True, True]]),  # fixed
+            12: np.array(
+                [[False, False, False], [False, False, False], [False, True, True]]
+            ),  # fixed
+            13: np.array([[True, True], [True, False], [False, False]]),  # fixed
+            14: np.array(
+                [[True, False, False], [True, False, False], [False, False, False]]
+            ),  # fixed
+            15: np.array([[True, True], [False, True], [False, False]]),  # fixed
+            16: np.array(
+                [[False, False, True], [False, False, True], [False, False, False]]
+            ),  # fixed
+            17: np.array([[True, True, False], [True, False, False]]),  # fixed
+            18: np.array(
+                [[True, True, False], [False, False, False], [False, False, False]]
+            ),  # fixed
+            19: np.array([[False, True, True], [False, False, True]]),  # fixed
+            20: np.array(
+                [[False, True, True], [False, False, False], [False, False, False]]
+            ),  # fixed
+            21: np.array([[False, False], [True, False], [True, True]]),  # fixed
+            22: np.array(
+                [[False, False, False], [True, False, False], [True, False, False]]
+            ),  # fixed
+            23: np.array([[False, False], [False, True], [True, True]]),  # fixed
+            24: np.array(
+                [[False, False, False], [False, False, True], [False, False, True]]
+            ),  # fixed
+            25: np.array([[True, False, False], [True, True, False]]),  # fixed
+            26: np.array(
+                [[False, False, False], [False, False, False], [True, True, False]]
+            ),  # fixed
+            27: np.array([[False, False, True], [False, True, True]]),  # fixed
+            28: np.array(
+                [[False, False, False], [False, False, False], [False, True, True]]
+            ),  # fixed
+            29: np.array([[True, True], [True, False], [False, False]]),  # fixed
+            30: np.array(
+                [[True, False, False], [True, False, False], [False, False, False]]
+            ),  # fixed
+            31: np.array([[True, True], [False, True], [False, False]]),  # fixed
+            32: np.array(
+                [[False, False, True], [False, False, True], [False, False, False]]
+            ),  # fixed
+            33: np.array([[True, True, False], [True, False, False]]),  # fixed
+            34: np.array(
+                [[True, True, False], [False, False, False], [False, False, False]]
+            ),  # fixed
+            35: np.array([[False, True, True], [False, False, True]]),  # fixed
+            36: np.array(
+                [[False, True, True], [False, False, False], [False, False, False]]
+            ),  # fixed
+            37: np.array([[False, False], [True, False], [True, True]]),  # fixed
+            38: np.array(
+                [[False, False, False], [True, False, False], [True, False, False]]
+            ),  # fixed
+            39: np.array([[False, False], [False, True], [True, True]]),  # fixed
+            40: np.array(
+                [[False, False, False], [False, False, True], [False, False, True]]
+            ),  # fixed
+            41: np.array([[True, False, False], [True, True, False]]),  # fixed
+            42: np.array(
+                [[False, False, False], [False, False, False], [True, True, False]]
+            ),  # fixed
+            43: np.array([[False, False, True], [False, True, True]]),  # fixed
+            44: np.array(
+                [[False, False, False], [False, False, False], [False, True, True]]
+            ),  # fixed
+            45: np.array([[True, True], [True, False], [False, False]]),  # fixed
+            46: np.array(
+                [[True, False, False], [True, False, False], [False, False, False]]
+            ),  # fixed
+            47: np.array([[True, True], [False, True], [False, False]]),  # fixed
+            48: np.array(
+                [[False, False, True], [False, False, True], [False, False, False]]
+            ),  # fixed
+        }
+        # true or false to represent no-pivot zones? False for consistency; True will represent free zones
+        self.free_zones = {
+            1: np.array([[True, False, False], [True, False, False]]),
+            2: np.array(
+                [[True, False, False], [False, False, False], [False, False, False]]
+            ),
+            3: np.array([[False, False, True], [False, False, True]]),
+            4: np.array(
+                [[False, False, True], [False, False, False], [False, False, False]]
+            ),
+            5: np.array([[False, False], [False, False], [True, True]]),
+            6: np.array(
+                [[False, False, False], [False, False, False], [True, False, False]]
+            ),
+            7: np.array([[False, False], [False, False], [True, True]]),
+            8: np.array(
+                [[False, False, False], [False, False, False], [False, False, True]]
+            ),
+            9: np.array([[True, False, False], [True, False, False]]),
+            10: np.array(
+                [[False, False, False], [False, False, False], [True, False, False]]
+            ),
+            11: np.array([[False, False, True], [False, False, True]]),
+            12: np.array(
+                [[False, False, False], [False, False, False], [False, False, True]]
+            ),
+            13: np.array([[True, True], [False, False], [False, False]]),
+            14: np.array(
+                [[True, False, False], [False, False, False], [False, False, False]]
+            ),
+            15: np.array([[True, True], [False, False], [False, False]]),
+            16: np.array(
+                [[False, False, True], [False, False, False], [False, False, False]]
+            ),
+            17: np.array([[True, False, False], [True, False, False]]),
+            18: np.array(
+                [[True, False, False], [False, False, False], [False, False, False]]
+            ),
+            19: np.array([[False, False, True], [False, False, True]]),
+            20: np.array(
+                [[False, False, True], [False, False, False], [False, False, False]]
+            ),
+            21: np.array([[False, False], [False, False], [True, True]]),
+            22: np.array(
+                [[False, False, False], [False, False, False], [True, False, False]]
+            ),
+            23: np.array([[False, False], [False, False], [True, True]]),
+            24: np.array(
+                [[False, False, False], [False, False, False], [False, False, True]]
+            ),
+            25: np.array([[True, False, False], [True, False, False]]),
+            26: np.array(
+                [[False, False, False], [False, False, False], [True, False, False]]
+            ),
+            27: np.array([[False, False, True], [False, False, True]]),
+            28: np.array(
+                [[False, False, False], [False, False, False], [False, False, True]]
+            ),
+            29: np.array([[True, True], [False, False], [False, False]]),
+            30: np.array(
+                [[True, False, False], [False, False, False], [False, False, False]]
+            ),
+            31: np.array([[True, True], [False, False], [False, False]]),
+            32: np.array(
+                [[False, False, True], [False, False, False], [False, False, False]]
+            ),
+            33: np.array([[True, False, False], [True, False, False]]),
+            34: np.array(
+                [[True, False, False], [False, False, False], [False, False, False]]
+            ),
+            35: np.array([[False, False, True], [False, False, True]]),
+            36: np.array(
+                [[False, False, True], [False, False, False], [False, False, False]]
+            ),
+            37: np.array([[False, False], [False, False], [True, True]]),
+            38: np.array(
+                [[False, False, False], [False, False, False], [True, False, False]]
+            ),
+            39: np.array([[False, False], [False, False], [True, True]]),
+            40: np.array(
+                [[False, False, False], [False, False, False], [False, False, True]]
+            ),
+            41: np.array([[True, False, False], [True, False, False]]),
+            42: np.array(
+                [[False, False, False], [False, False, False], [True, False, False]]
+            ),
+            43: np.array([[False, False, True], [False, False, True]]),
+            44: np.array(
+                [[False, False, False], [False, False, False], [False, False, True]]
+            ),
+            45: np.array([[True, True], [False, False], [False, False]]),
+            46: np.array(
+                [[True, False, False], [False, False, False], [False, False, False]]
+            ),
+            47: np.array([[True, True], [False, False], [False, False]]),
+            48: np.array(
+                [[False, False, True], [False, False, False], [False, False, False]]
+            ),
+        }
 
-    return self.possible_actions
-  
-  # For the pairwise norm-based actions, we want to calculate pairwise norms based on the results of the actions, an after-action grid map as the counter to the pre-action grid map. Or rather, a temporary grid map is returned after calculations are performed on the current grid map.
-  def calc_post_pairwise_norms(self):
-    self.post_action_pairwise_norms = {}
+        # 3 rows for x, y, z, respectively, with start, stop
+        self.ranges = {
+            1: np.array([[0, 1], [-1, 1], [0, 0]]),
+            2: np.array([[0, 2], [-1, 1], [0, 0]]),
+            3: np.array([[0, 1], [-1, 1], [0, 0]]),
+            4: np.array([[0, 2], [-1, 1], [0, 0]]),
+            5: np.array([[-1, 1], [0, 1], [0, 0]]),
+            6: np.array([[-1, 1], [0, 2], [0, 0]]),
+            7: np.array([[-1, 1], [-1, 0], [0, 0]]),  # does the negative stuff work?
+            8: np.array([[-1, 1], [-2, 0], [0, 0]]),  # does the negative stuff work?
+            9: np.array([[-1, 0], [-1, 1], [0, 0]]),
+            10: np.array([[-2, 0], [-1, 1], [0, 0]]),
+            11: np.array([[-1, 0], [-1, 1], [0, 0]]),
+            12: np.array([[-2, 0], [-1, 1], [0, 0]]),
+            13: np.array([[-1, 1], [0, 1], [0, 0]]),
+            14: np.array([[-1, 1], [0, 2], [0, 0]]),
+            15: np.array([[-1, 1], [-1, 0], [0, 0]]),  # does the negative stuff work?
+            16: np.array(
+                [[-1, 1], [-2, 0], [0, 0]]
+            ),  # does the negative stuff work? # now switch which dimension stays the same
+            17: np.array([[0, 1], [0, 0], [-1, 1]]),
+            18: np.array([[0, 2], [0, 0], [-1, 1]]),
+            19: np.array([[0, 1], [0, 0], [-1, 1]]),
+            20: np.array([[0, 2], [0, 0], [-1, 1]]),
+            21: np.array([[-1, 1], [0, 0], [0, 1]]),
+            22: np.array([[-1, 1], [0, 0], [0, 2]]),
+            23: np.array([[-1, 1], [0, 0], [-1, 0]]),  # does the negative stuff work?
+            24: np.array([[-1, 1], [0, 0], [-2, 0]]),  # does the negative stuff work?
+            25: np.array([[-1, 0], [0, 0], [-1, 1]]),
+            26: np.array([[-2, 0], [0, 0], [-1, 1]]),
+            27: np.array([[-1, 0], [0, 0], [-1, 1]]),
+            28: np.array([[-2, 0], [0, 0], [-1, 1]]),
+            29: np.array([[-1, 1], [0, 0], [0, 1]]),
+            30: np.array([[-1, 1], [0, 0], [0, 2]]),
+            31: np.array([[-1, 1], [0, 0], [-1, 0]]),  # does the negative stuff work?
+            32: np.array(
+                [[-1, 1], [0, 0], [-2, 0]]
+            ),  # does the negative stuff work? # now switch which dimension stays the same
+            33: np.array([[0, 0], [0, 1], [-1, 1]]),
+            34: np.array([[0, 0], [0, 2], [-1, 1]]),
+            35: np.array([[0, 0], [0, 1], [-1, 1]]),
+            36: np.array([[0, 0], [0, 2], [-1, 1]]),
+            37: np.array([[0, 0], [-1, 1], [0, 1]]),
+            38: np.array([[0, 0], [-1, 1], [0, 2]]),
+            39: np.array([[0, 0], [-1, 1], [-1, 0]]),  # does the negative stuff work?
+            40: np.array([[0, 0], [-1, 1], [-2, 0]]),  # does the negative stuff work?
+            41: np.array([[0, 0], [-1, 0], [-1, 1]]),
+            42: np.array([[0, 0], [-2, 0], [-1, 1]]),
+            43: np.array([[0, 0], [-1, 0], [-1, 1]]),
+            44: np.array([[0, 0], [-2, 0], [-1, 1]]),
+            45: np.array([[0, 0], [-1, 1], [0, 1]]),
+            46: np.array([[0, 0], [-1, 1], [0, 2]]),
+            47: np.array([[0, 0], [-1, 1], [-1, 0]]),  # does the negative stuff work?
+            48: np.array(
+                [[0, 0], [-1, 1], [-2, 0]]
+            ),  # does the negative stuff work? # now switch which dimension stays the same
+        }
 
-    for module in self.modules:
-      module_position = self.module_positions[module]
-      actions = self.possible_actions[module]
-      self.post_action_pairwise_norms[module] = {}
+    # return the queue of randomized modules:
+    def calc_queue(self):
+        arr = np.arange(1, len(self.modules) + 1)
+        np.random.shuffle(arr)
+        return arr
 
-      for actindex in range(len(actions)):
+    def calc_possible_actions(
+        self, module=None
+    ):  # need to check now that neighbor is free
+        # need to add stuff to account for the pre_action_grid_map; need to have corresponding edges for the pre_action_grid_map
+        # what about module positions? Or maybe just calculate for a specific module???
+        # Do we ever require the full set of each module's actions? Don't we query each module individually? Does it matter?
+        self.possible_actions = {}
+        self.possible_pre_actions = {}
+        self.articulation_points = set(
+            self.articulationPoints(len(self.modules), self.edges)
+        )
+        # print("articulation_points\n")
+        # print(self.articulation_points)
 
-        if actions[actindex]:
-          action = actindex + 1
-        else:
-          continue
+        for m in self.modules:
+            # ipdb.set_trace()
+            self.possible_actions[m] = np.array(list(range(49))) >= 48
+            self.possible_pre_actions[m] = np.array(list(range(49))) >= 48
+
+            if (
+                (module is None or m == module)
+                and m not in self.articulation_points
+                and m not in self.pre_action_articulation_points
+            ):
+                module_position = self.module_positions[m]
+
+                # will go to 48
+                for p in range(1, 49):
+                    # ipdb.set_trace()
+                    rangethingy = self.ranges[p]
+                    offset_x = module_position[0] + rangethingy[0]
+                    offset_y = module_position[1] + rangethingy[1]
+                    offset_z = module_position[2] + rangethingy[2]
+
+                    sliced = self.curr_grid_map[
+                        offset_x[0] : (offset_x[1] + 1),
+                        offset_y[0] : (offset_y[1] + 1),
+                        offset_z[0] : (offset_z[1] + 1),
+                    ]
+                    pre_sliced = self.pre_action_grid_map[
+                        offset_x[0] : (offset_x[1] + 1),
+                        offset_y[0] : (offset_y[1] + 1),
+                        offset_z[0] : (offset_z[1] + 1),
+                    ]
+                    zone_slice = self.pivot_zone_grid_map[
+                        offset_x[0] : (offset_x[1] + 1),
+                        offset_y[0] : (offset_y[1] + 1),
+                        offset_z[0] : (offset_z[1] + 1),
+                    ]
+
+                    booled = np.squeeze(sliced > 0)
+                    pa = self.possible_actions[m]
+                    pa[p - 1] = np.all(booled == self.potential_pivots[p]) and np.all(
+                        zone_slice
+                    )
+                    self.possible_actions[m] = pa
+
+                    # pre_booled = np.squeeze(pre_sliced > 0)
+                    # pre_pa = self.possible_pre_actions[m]
+                    # pre_pa[p - 1] = np.all(pre_booled == self.potential_pivots[p])
+                    # self.possible_pre_actions[m] = pre_pa
+
+                    # get rid of the pre_pa stuff and replace with pivot zones
+                    # self.possible_actions[m] = pa & pre_pa
+
+                    # will need to add ranges that will act as no-pivot zones; add to sets
+                    # they'll be the offsets, will need a way to check intersections
+                    # we can just add 4 to 9 tuple coordinates to the set
+
+                    # OR we can create a mirror grid map that shows module numbers where pivots can't happen, and reference against that
+                    # self.pivot_zone_grid_map
+
+        # for m in self.modules:
+        #   print(np.where(self.possible_actions[m])[0] + 1)
+
+        return self.possible_actions
+
+    # For the pairwise norm-based actions, we want to calculate pairwise norms based on the results of the actions, an after-action grid map as the counter to the pre-action grid map. Or rather, a temporary grid map is returned after calculations are performed on the current grid map.
+    def calc_post_pairwise_norms(self):
+        self.post_action_pairwise_norms = {}
+
+        for module in self.modules:
+            module_position = self.module_positions[module]
+            actions = self.possible_actions[module]
+            self.post_action_pairwise_norms[module] = {}
+
+            for actindex in range(len(actions)):
+                if actions[actindex]:
+                    action = actindex + 1
+                else:
+                    continue
+
+                match action:
+                    case 1:
+                        new_module_position = (
+                            module_position[0] + 1,
+                            module_position[1],
+                            module_position[2],
+                        )
+                    case 2:
+                        new_module_position = (
+                            module_position[0] + 1,
+                            module_position[1] - 1,
+                            module_position[2],
+                        )
+                    case 3:  #
+                        new_module_position = (
+                            module_position[0] + 1,
+                            module_position[1],
+                            module_position[2],
+                        )
+                    case 4:
+                        new_module_position = (
+                            module_position[0] + 1,
+                            module_position[1] + 1,
+                            module_position[2],
+                        )
+                    case 5:
+                        new_module_position = (
+                            module_position[0],
+                            module_position[1] + 1,
+                            module_position[2],
+                        )
+                    case 6:
+                        new_module_position = (
+                            module_position[0] + 1,
+                            module_position[1] + 1,
+                            module_position[2],
+                        )
+                    case 7:
+                        new_module_position = (
+                            module_position[0],
+                            module_position[1] - 1,
+                            module_position[2],
+                        )
+                    case 8:
+                        new_module_position = (
+                            module_position[0] + 1,
+                            module_position[1] - 1,
+                            module_position[2],
+                        )
+                    case 9:
+                        new_module_position = (
+                            module_position[0] - 1,
+                            module_position[1],
+                            module_position[2],
+                        )
+                    case 10:
+                        new_module_position = (
+                            module_position[0] - 1,
+                            module_position[1] - 1,
+                            module_position[2],
+                        )
+                    case 11:
+                        new_module_position = (
+                            module_position[0] - 1,
+                            module_position[1],
+                            module_position[2],
+                        )
+                    case 12:  #
+                        new_module_position = (
+                            module_position[0] - 1,
+                            module_position[1] + 1,
+                            module_position[2],
+                        )
+                    case 13:
+                        new_module_position = (
+                            module_position[0],
+                            module_position[1] + 1,
+                            module_position[2],
+                        )
+                    case 14:
+                        new_module_position = (
+                            module_position[0] - 1,
+                            module_position[1] + 1,
+                            module_position[2],
+                        )
+                    case 15:
+                        new_module_position = (
+                            module_position[0],
+                            module_position[1] - 1,
+                            module_position[2],
+                        )
+                    case 16:  #####################
+                        new_module_position = (
+                            module_position[0] - 1,
+                            module_position[1] - 1,
+                            module_position[2],
+                        )
+                    case 17:
+                        new_module_position = (
+                            module_position[0] + 1,
+                            module_position[1],
+                            module_position[2],
+                        )
+                    case 18:
+                        new_module_position = (
+                            module_position[0] + 1,
+                            module_position[1],
+                            module_position[2] - 1,
+                        )  # fixed
+                    case 19:  #
+                        new_module_position = (
+                            module_position[0] + 1,
+                            module_position[1],
+                            module_position[2],
+                        )
+                    case 20:
+                        new_module_position = (
+                            module_position[0] + 1,
+                            module_position[1],
+                            module_position[2] + 1,
+                        )  # fixed
+                    case 21:
+                        new_module_position = (
+                            module_position[0],
+                            module_position[1],
+                            module_position[2] + 1,
+                        )  # fixed
+                    case 22:
+                        new_module_position = (
+                            module_position[0] + 1,
+                            module_position[1],
+                            module_position[2] + 1,
+                        )  # fixed
+                    case 23:
+                        new_module_position = (
+                            module_position[0],
+                            module_position[1],
+                            module_position[2] - 1,
+                        )  # fixed
+                    case 24:
+                        new_module_position = (
+                            module_position[0] + 1,
+                            module_position[1],
+                            module_position[2] - 1,
+                        )
+                    case 25:
+                        new_module_position = (
+                            module_position[0] - 1,
+                            module_position[1],
+                            module_position[2],
+                        )
+                    case 26:
+                        new_module_position = (
+                            module_position[0] - 1,
+                            module_position[1],
+                            module_position[2] - 1,
+                        )
+                    case 27:
+                        new_module_position = (
+                            module_position[0] - 1,
+                            module_position[1],
+                            module_position[2],
+                        )
+                    case 28:  #
+                        new_module_position = (
+                            module_position[0] - 1,
+                            module_position[1],
+                            module_position[2] + 1,
+                        )
+                    case 29:
+                        new_module_position = (
+                            module_position[0],
+                            module_position[1],
+                            module_position[2] + 1,
+                        )
+                    case 30:
+                        new_module_position = (
+                            module_position[0] - 1,
+                            module_position[1],
+                            module_position[2] + 1,
+                        )
+                    case 31:
+                        new_module_position = (
+                            module_position[0],
+                            module_position[1],
+                            module_position[2] - 1,
+                        )
+                    case 32:  #####################
+                        new_module_position = (
+                            module_position[0] - 1,
+                            module_position[1],
+                            module_position[2] - 1,
+                        )
+                    case 33:
+                        new_module_position = (
+                            module_position[0],
+                            module_position[1] + 1,
+                            module_position[2],
+                        )
+                    case 34:
+                        new_module_position = (
+                            module_position[0],
+                            module_position[1] + 1,
+                            module_position[2] - 1,
+                        )
+                    case 35:  #
+                        new_module_position = (
+                            module_position[0],
+                            module_position[1] + 1,
+                            module_position[2],
+                        )
+                    case 36:
+                        new_module_position = (
+                            module_position[0],
+                            module_position[1] + 1,
+                            module_position[2] + 1,
+                        )
+                    case 37:
+                        new_module_position = (
+                            module_position[0],
+                            module_position[1],
+                            module_position[2] + 1,
+                        )
+                    case 38:
+                        new_module_position = (
+                            module_position[0],
+                            module_position[1] + 1,
+                            module_position[2] + 1,
+                        )
+                    case 39:
+                        new_module_position = (
+                            module_position[0],
+                            module_position[1],
+                            module_position[2] - 1,
+                        )
+                    case 40:
+                        new_module_position = (
+                            module_position[0],
+                            module_position[1] + 1,
+                            module_position[2] - 1,
+                        )
+                    case 41:
+                        new_module_position = (
+                            module_position[0],
+                            module_position[1] - 1,
+                            module_position[2],
+                        )
+                    case 42:
+                        new_module_position = (
+                            module_position[0],
+                            module_position[1] - 1,
+                            module_position[2] - 1,
+                        )
+                    case 43:
+                        new_module_position = (
+                            module_position[0],
+                            module_position[1] - 1,
+                            module_position[2],
+                        )
+                    case 44:  #
+                        new_module_position = (
+                            module_position[0],
+                            module_position[1] - 1,
+                            module_position[2] + 1,
+                        )
+                    case 45:
+                        new_module_position = (
+                            module_position[0],
+                            module_position[1],
+                            module_position[2] + 1,
+                        )
+                    case 46:
+                        new_module_position = (
+                            module_position[0],
+                            module_position[1] - 1,
+                            module_position[2] + 1,
+                        )
+                    case 47:
+                        new_module_position = (
+                            module_position[0],
+                            module_position[1],
+                            module_position[2] - 1,
+                        )
+                    case 48:  #####################
+                        new_module_position = (
+                            module_position[0],
+                            module_position[1] - 1,
+                            module_position[2] - 1,
+                        )
+                    case 49:
+                        new_module_position = self.module_positions[module]
+
+                # post_action_grid_map = np.empty_like(self.curr_grid_map)
+                # post_action_grid_map[:] = self.curr_grid_map
+                post_action_module_positions = self.module_positions.copy()
+                # post_action_grid_map[module_position[0], module_position[1], module_position[2]] = 0
+                # post_action_grid_map[new_module_position[0], new_module_position[1], new_module_position[2]] = module
+                post_action_module_positions[module] = new_module_position
+                # Store post-action pairwise norms in the same "difference to final"
+                # space used by `curr_pairwise_norms`.
+                mat1 = self.calc_pairwise_norms(post_action_module_positions)
+                self.post_action_pairwise_norms[module][action] = (
+                    mat1
+                    - self.calc_current_v_reassigned_final(
+                        mat1, self.final_pairwise_norms
+                    )
+                )
+        return self.post_action_pairwise_norms
+        # we also need some way to map the pairwise norms to actions. Maybe just use the keys?
+
+    def take_action(self, module, action):
+        module_position = self.module_positions[module]
 
         match action:
-          case 1:
-            new_module_position = (module_position[0] + 1, module_position[1], module_position[2])
-          case 2:
-            new_module_position = (module_position[0] + 1, module_position[1] - 1, module_position[2])
-          case 3:#
-            new_module_position = (module_position[0] + 1, module_position[1], module_position[2])
-          case 4:
-            new_module_position = (module_position[0] + 1, module_position[1] + 1, module_position[2])
-          case 5:
-            new_module_position = (module_position[0], module_position[1] + 1, module_position[2])
-          case 6:
-            new_module_position = (module_position[0] + 1, module_position[1] + 1, module_position[2])
-          case 7:
-            new_module_position = (module_position[0], module_position[1] - 1, module_position[2])
-          case 8:
-            new_module_position = (module_position[0] + 1, module_position[1] - 1, module_position[2])
-          case 9:
-            new_module_position = (module_position[0] - 1, module_position[1], module_position[2])
-          case 10:
-            new_module_position = (module_position[0] - 1, module_position[1] - 1, module_position[2])
-          case 11:
-            new_module_position = (module_position[0] - 1, module_position[1], module_position[2])
-          case 12:#
-            new_module_position = (module_position[0] - 1, module_position[1] + 1, module_position[2])
-          case 13:
-            new_module_position = (module_position[0], module_position[1] + 1, module_position[2])
-          case 14:
-            new_module_position = (module_position[0] - 1, module_position[1] + 1, module_position[2])
-          case 15:
-            new_module_position = (module_position[0], module_position[1] - 1, module_position[2])
-          case 16:#####################
-            new_module_position = (module_position[0] - 1, module_position[1] - 1, module_position[2])
-          case 17:
-            new_module_position = (module_position[0] + 1, module_position[1], module_position[2])
-          case 18:
-            new_module_position = (module_position[0] + 1, module_position[1], module_position[2] - 1) #fixed
-          case 19:#
-            new_module_position = (module_position[0] + 1, module_position[1], module_position[2])
-          case 20:
-            new_module_position = (module_position[0] + 1, module_position[1], module_position[2] + 1) #fixed
-          case 21:
-            new_module_position = (module_position[0], module_position[1], module_position[2] + 1) #fixed
-          case 22:
-            new_module_position = (module_position[0] + 1, module_position[1], module_position[2] + 1) #fixed
-          case 23:
-            new_module_position = (module_position[0], module_position[1], module_position[2] - 1) #fixed
-          case 24:
-            new_module_position = (module_position[0] + 1, module_position[1], module_position[2] - 1)
-          case 25:
-            new_module_position = (module_position[0] - 1, module_position[1], module_position[2])
-          case 26:
-            new_module_position = (module_position[0] - 1, module_position[1], module_position[2] - 1)
-          case 27:
-            new_module_position = (module_position[0] - 1, module_position[1], module_position[2])
-          case 28:#
-            new_module_position = (module_position[0] - 1, module_position[1], module_position[2] + 1)
-          case 29:
-            new_module_position = (module_position[0], module_position[1], module_position[2] + 1)
-          case 30:
-            new_module_position = (module_position[0] - 1, module_position[1], module_position[2] + 1)
-          case 31:
-            new_module_position = (module_position[0], module_position[1], module_position[2] - 1)
-          case 32:#####################
-            new_module_position = (module_position[0] - 1, module_position[1], module_position[2] - 1)
-          case 33:
-            new_module_position = (module_position[0], module_position[1] + 1, module_position[2])
-          case 34:
-            new_module_position = (module_position[0], module_position[1] + 1, module_position[2] - 1)
-          case 35:#
-            new_module_position = (module_position[0], module_position[1] + 1, module_position[2])
-          case 36:
-            new_module_position = (module_position[0], module_position[1] + 1, module_position[2] + 1)
-          case 37:
-            new_module_position = (module_position[0], module_position[1], module_position[2] + 1)
-          case 38:
-            new_module_position = (module_position[0], module_position[1] + 1, module_position[2] + 1) 
-          case 39:
-            new_module_position = (module_position[0], module_position[1], module_position[2] - 1)
-          case 40:
-            new_module_position = (module_position[0], module_position[1] + 1, module_position[2] - 1)
-          case 41:
-            new_module_position = (module_position[0], module_position[1] - 1, module_position[2])
-          case 42:
-            new_module_position = (module_position[0], module_position[1] - 1, module_position[2] - 1)
-          case 43:
-            new_module_position = (module_position[0], module_position[1] - 1, module_position[2])
-          case 44:#
-            new_module_position = (module_position[0], module_position[1] - 1, module_position[2] + 1)
-          case 45:
-            new_module_position = (module_position[0], module_position[1], module_position[2] + 1)
-          case 46:
-            new_module_position = (module_position[0], module_position[1] - 1, module_position[2] + 1)
-          case 47:
-            new_module_position = (module_position[0], module_position[1], module_position[2] - 1)
-          case 48:#####################
-            new_module_position = (module_position[0], module_position[1] - 1, module_position[2] - 1)
-          case 49:
-            new_module_position = self.module_positions[module]
+            case 1:
+                new_module_position = (
+                    module_position[0] + 1,
+                    module_position[1],
+                    module_position[2],
+                )
+            case 2:
+                new_module_position = (
+                    module_position[0] + 1,
+                    module_position[1] - 1,
+                    module_position[2],
+                )
+            case 3:  #
+                new_module_position = (
+                    module_position[0] + 1,
+                    module_position[1],
+                    module_position[2],
+                )
+            case 4:
+                new_module_position = (
+                    module_position[0] + 1,
+                    module_position[1] + 1,
+                    module_position[2],
+                )
+            case 5:
+                new_module_position = (
+                    module_position[0],
+                    module_position[1] + 1,
+                    module_position[2],
+                )
+            case 6:
+                new_module_position = (
+                    module_position[0] + 1,
+                    module_position[1] + 1,
+                    module_position[2],
+                )
+            case 7:
+                new_module_position = (
+                    module_position[0],
+                    module_position[1] - 1,
+                    module_position[2],
+                )
+            case 8:
+                new_module_position = (
+                    module_position[0] + 1,
+                    module_position[1] - 1,
+                    module_position[2],
+                )
+            case 9:
+                new_module_position = (
+                    module_position[0] - 1,
+                    module_position[1],
+                    module_position[2],
+                )
+            case 10:
+                new_module_position = (
+                    module_position[0] - 1,
+                    module_position[1] - 1,
+                    module_position[2],
+                )
+            case 11:
+                new_module_position = (
+                    module_position[0] - 1,
+                    module_position[1],
+                    module_position[2],
+                )
+            case 12:  #
+                new_module_position = (
+                    module_position[0] - 1,
+                    module_position[1] + 1,
+                    module_position[2],
+                )
+            case 13:
+                new_module_position = (
+                    module_position[0],
+                    module_position[1] + 1,
+                    module_position[2],
+                )
+            case 14:
+                new_module_position = (
+                    module_position[0] - 1,
+                    module_position[1] + 1,
+                    module_position[2],
+                )
+            case 15:
+                new_module_position = (
+                    module_position[0],
+                    module_position[1] - 1,
+                    module_position[2],
+                )
+            case 16:  #####################
+                new_module_position = (
+                    module_position[0] - 1,
+                    module_position[1] - 1,
+                    module_position[2],
+                )
+            case 17:
+                new_module_position = (
+                    module_position[0] + 1,
+                    module_position[1],
+                    module_position[2],
+                )
+            case 18:
+                new_module_position = (
+                    module_position[0] + 1,
+                    module_position[1],
+                    module_position[2] - 1,
+                )  # fixed
+            case 19:  #
+                new_module_position = (
+                    module_position[0] + 1,
+                    module_position[1],
+                    module_position[2],
+                )
+            case 20:
+                new_module_position = (
+                    module_position[0] + 1,
+                    module_position[1],
+                    module_position[2] + 1,
+                )  # fixed
+            case 21:
+                new_module_position = (
+                    module_position[0],
+                    module_position[1],
+                    module_position[2] + 1,
+                )  # fixed
+            case 22:
+                new_module_position = (
+                    module_position[0] + 1,
+                    module_position[1],
+                    module_position[2] + 1,
+                )  # fixed
+            case 23:
+                new_module_position = (
+                    module_position[0],
+                    module_position[1],
+                    module_position[2] - 1,
+                )  # fixed
+            case 24:
+                new_module_position = (
+                    module_position[0] + 1,
+                    module_position[1],
+                    module_position[2] - 1,
+                )
+            case 25:
+                new_module_position = (
+                    module_position[0] - 1,
+                    module_position[1],
+                    module_position[2],
+                )
+            case 26:
+                new_module_position = (
+                    module_position[0] - 1,
+                    module_position[1],
+                    module_position[2] - 1,
+                )
+            case 27:
+                new_module_position = (
+                    module_position[0] - 1,
+                    module_position[1],
+                    module_position[2],
+                )
+            case 28:  #
+                new_module_position = (
+                    module_position[0] - 1,
+                    module_position[1],
+                    module_position[2] + 1,
+                )
+            case 29:
+                new_module_position = (
+                    module_position[0],
+                    module_position[1],
+                    module_position[2] + 1,
+                )
+            case 30:
+                new_module_position = (
+                    module_position[0] - 1,
+                    module_position[1],
+                    module_position[2] + 1,
+                )
+            case 31:
+                new_module_position = (
+                    module_position[0],
+                    module_position[1],
+                    module_position[2] - 1,
+                )
+            case 32:  #####################
+                new_module_position = (
+                    module_position[0] - 1,
+                    module_position[1],
+                    module_position[2] - 1,
+                )
+            case 33:
+                new_module_position = (
+                    module_position[0],
+                    module_position[1] + 1,
+                    module_position[2],
+                )
+            case 34:
+                new_module_position = (
+                    module_position[0],
+                    module_position[1] + 1,
+                    module_position[2] - 1,
+                )
+            case 35:  #
+                new_module_position = (
+                    module_position[0],
+                    module_position[1] + 1,
+                    module_position[2],
+                )
+            case 36:
+                new_module_position = (
+                    module_position[0],
+                    module_position[1] + 1,
+                    module_position[2] + 1,
+                )
+            case 37:
+                new_module_position = (
+                    module_position[0],
+                    module_position[1],
+                    module_position[2] + 1,
+                )
+            case 38:
+                new_module_position = (
+                    module_position[0],
+                    module_position[1] + 1,
+                    module_position[2] + 1,
+                )
+            case 39:
+                new_module_position = (
+                    module_position[0],
+                    module_position[1],
+                    module_position[2] - 1,
+                )
+            case 40:
+                new_module_position = (
+                    module_position[0],
+                    module_position[1] + 1,
+                    module_position[2] - 1,
+                )
+            case 41:
+                new_module_position = (
+                    module_position[0],
+                    module_position[1] - 1,
+                    module_position[2],
+                )
+            case 42:
+                new_module_position = (
+                    module_position[0],
+                    module_position[1] - 1,
+                    module_position[2] - 1,
+                )
+            case 43:
+                new_module_position = (
+                    module_position[0],
+                    module_position[1] - 1,
+                    module_position[2],
+                )
+            case 44:  #
+                new_module_position = (
+                    module_position[0],
+                    module_position[1] - 1,
+                    module_position[2] + 1,
+                )
+            case 45:
+                new_module_position = (
+                    module_position[0],
+                    module_position[1],
+                    module_position[2] + 1,
+                )
+            case 46:
+                new_module_position = (
+                    module_position[0],
+                    module_position[1] - 1,
+                    module_position[2] + 1,
+                )
+            case 47:
+                new_module_position = (
+                    module_position[0],
+                    module_position[1],
+                    module_position[2] - 1,
+                )
+            case 48:  #####################
+                new_module_position = (
+                    module_position[0],
+                    module_position[1] - 1,
+                    module_position[2] - 1,
+                )
+            case 49:
+                new_module_position = self.module_positions[module]
 
-        #post_action_grid_map = np.empty_like(self.curr_grid_map)
-        #post_action_grid_map[:] = self.curr_grid_map
-        post_action_module_positions = self.module_positions.copy()
-        #post_action_grid_map[module_position[0], module_position[1], module_position[2]] = 0
-        #post_action_grid_map[new_module_position[0], new_module_position[1], new_module_position[2]] = module
-        post_action_module_positions[module] = new_module_position
-        # Store post-action pairwise norms in the same "difference to final"
-        # space used by `curr_pairwise_norms`.
-        mat1 = self.calc_pairwise_norms(post_action_module_positions)
-        self.post_action_pairwise_norms[module][action] = (
-            mat1 - self.calc_current_v_reassigned_final(mat1, self.final_pairwise_norms)
+        self.curr_grid_map[
+            module_position[0], module_position[1], module_position[2]
+        ] = 0
+        self.curr_grid_map[
+            new_module_position[0], new_module_position[1], new_module_position[2]
+        ] = module
+        self.module_positions[module] = new_module_position
+        self.edges = self.calculate_edges(self.modules, self.module_positions)
+        self.calc_pivot_zones(action, module_position)
+
+        # Keep `curr_pairwise_norms` in sync with the current configuration,
+        # expressed as (current_pairwise_norms - final_pairwise_norms) so that a
+        # zero matrix corresponds to the goal configuration.
+        mat1 = self.calc_pairwise_norms(self.module_positions)
+        self.curr_pairwise_norms = mat1 - self.calc_current_v_reassigned_final(
+            mat1, self.final_pairwise_norms
         )
-    return self.post_action_pairwise_norms
-      # we also need some way to map the pairwise norms to actions. Maybe just use the keys?
 
+    def calc_pivot_zones(self, action, module_position):
+        if action < 49:
+            rangethingy = self.ranges[action]
+            offset_x = module_position[0] + rangethingy[0]
+            offset_y = module_position[1] + rangethingy[1]
+            offset_z = module_position[2] + rangethingy[2]
 
-  def take_action(self, module, action):
-    module_position = self.module_positions[module]
+            if action < 17:
+                slice = np.expand_dims(self.free_zones[action], axis=2)
+            elif action < 33:
+                slice = np.expand_dims(self.free_zones[action], axis=1)
+            else:
+                slice = np.expand_dims(self.free_zones[action], axis=0)
 
-    match action:
-      case 1:
-        new_module_position = (module_position[0] + 1, module_position[1], module_position[2])
-      case 2:
-        new_module_position = (module_position[0] + 1, module_position[1] - 1, module_position[2])
-      case 3:#
-        new_module_position = (module_position[0] + 1, module_position[1], module_position[2])
-      case 4:
-        new_module_position = (module_position[0] + 1, module_position[1] + 1, module_position[2])
-      case 5:
-        new_module_position = (module_position[0], module_position[1] + 1, module_position[2])
-      case 6:
-        new_module_position = (module_position[0] + 1, module_position[1] + 1, module_position[2])
-      case 7:
-        new_module_position = (module_position[0], module_position[1] - 1, module_position[2])
-      case 8:
-        new_module_position = (module_position[0] + 1, module_position[1] - 1, module_position[2])
-      case 9:
-        new_module_position = (module_position[0] - 1, module_position[1], module_position[2])
-      case 10:
-        new_module_position = (module_position[0] - 1, module_position[1] - 1, module_position[2])
-      case 11:
-        new_module_position = (module_position[0] - 1, module_position[1], module_position[2])
-      case 12:#
-        new_module_position = (module_position[0] - 1, module_position[1] + 1, module_position[2])
-      case 13:
-        new_module_position = (module_position[0], module_position[1] + 1, module_position[2])
-      case 14:
-        new_module_position = (module_position[0] - 1, module_position[1] + 1, module_position[2])
-      case 15:
-        new_module_position = (module_position[0], module_position[1] - 1, module_position[2])
-      case 16:#####################
-        new_module_position = (module_position[0] - 1, module_position[1] - 1, module_position[2])
-      case 17:
-        new_module_position = (module_position[0] + 1, module_position[1], module_position[2])
-      case 18:
-        new_module_position = (module_position[0] + 1, module_position[1], module_position[2] - 1) #fixed
-      case 19:#
-        new_module_position = (module_position[0] + 1, module_position[1], module_position[2])
-      case 20:
-        new_module_position = (module_position[0] + 1, module_position[1], module_position[2] + 1) #fixed
-      case 21:
-        new_module_position = (module_position[0], module_position[1], module_position[2] + 1) #fixed
-      case 22:
-        new_module_position = (module_position[0] + 1, module_position[1], module_position[2] + 1) #fixed
-      case 23:
-        new_module_position = (module_position[0], module_position[1], module_position[2] - 1) #fixed
-      case 24:
-        new_module_position = (module_position[0] + 1, module_position[1], module_position[2] - 1)
-      case 25:
-        new_module_position = (module_position[0] - 1, module_position[1], module_position[2])
-      case 26:
-        new_module_position = (module_position[0] - 1, module_position[1], module_position[2] - 1)
-      case 27:
-        new_module_position = (module_position[0] - 1, module_position[1], module_position[2])
-      case 28:#
-        new_module_position = (module_position[0] - 1, module_position[1], module_position[2] + 1)
-      case 29:
-        new_module_position = (module_position[0], module_position[1], module_position[2] + 1)
-      case 30:
-        new_module_position = (module_position[0] - 1, module_position[1], module_position[2] + 1)
-      case 31:
-        new_module_position = (module_position[0], module_position[1], module_position[2] - 1)
-      case 32:#####################
-        new_module_position = (module_position[0] - 1, module_position[1], module_position[2] - 1)
-      case 33:
-        new_module_position = (module_position[0], module_position[1] + 1, module_position[2])
-      case 34:
-        new_module_position = (module_position[0], module_position[1] + 1, module_position[2] - 1)
-      case 35:#
-        new_module_position = (module_position[0], module_position[1] + 1, module_position[2])
-      case 36:
-        new_module_position = (module_position[0], module_position[1] + 1, module_position[2] + 1)
-      case 37:
-        new_module_position = (module_position[0], module_position[1], module_position[2] + 1)
-      case 38:
-        new_module_position = (module_position[0], module_position[1] + 1, module_position[2] + 1) 
-      case 39:
-        new_module_position = (module_position[0], module_position[1], module_position[2] - 1)
-      case 40:
-        new_module_position = (module_position[0], module_position[1] + 1, module_position[2] - 1)
-      case 41:
-        new_module_position = (module_position[0], module_position[1] - 1, module_position[2])
-      case 42:
-        new_module_position = (module_position[0], module_position[1] - 1, module_position[2] - 1)
-      case 43:
-        new_module_position = (module_position[0], module_position[1] - 1, module_position[2])
-      case 44:#
-        new_module_position = (module_position[0], module_position[1] - 1, module_position[2] + 1)
-      case 45:
-        new_module_position = (module_position[0], module_position[1], module_position[2] + 1)
-      case 46:
-        new_module_position = (module_position[0], module_position[1] - 1, module_position[2] + 1)
-      case 47:
-        new_module_position = (module_position[0], module_position[1], module_position[2] - 1)
-      case 48:#####################
-        new_module_position = (module_position[0], module_position[1] - 1, module_position[2] - 1)
-      case 49:
-        new_module_position = self.module_positions[module]
+            self.pivot_zone_grid_map[
+                offset_x[0] : (offset_x[1] + 1),
+                offset_y[0] : (offset_y[1] + 1),
+                offset_z[0] : (offset_z[1] + 1),
+            ] = slice
 
-    self.curr_grid_map[module_position[0], module_position[1], module_position[2]] = 0
-    self.curr_grid_map[new_module_position[0], new_module_position[1], new_module_position[2]] = module
-    self.module_positions[module] = new_module_position
-    self.edges = self.calculate_edges(self.modules, self.module_positions)
-    self.calc_pivot_zones(action, module_position)
+    # once all modules have taken their action during the action phase, we will reset the pre_action_grid_map to curr_grid_map
+    def calc_pre_action_grid_map(self):
+        self.recenter()
+        self.edges = self.calculate_edges(self.modules, self.module_positions)
+        self.pre_action_grid_map = np.empty_like(self.curr_grid_map)
+        self.pivot_zone_grid_map = np.full(self.curr_grid_map.shape, True)
+        self.pre_action_grid_map[:] = self.curr_grid_map
+        self.pre_action_edges = self.edges.copy()
+        self.pre_action_articulation_points = set(
+            self.articulationPoints(len(self.modules), self.pre_action_edges)
+        )
 
-    # Keep `curr_pairwise_norms` in sync with the current configuration,
-    # expressed as (current_pairwise_norms - final_pairwise_norms) so that a
-    # zero matrix corresponds to the goal configuration.
-    mat1 = self.calc_pairwise_norms(self.module_positions)
-    self.curr_pairwise_norms = mat1 - self.calc_current_v_reassigned_final(mat1, self.final_pairwise_norms)
+    # Calculate and return pairwise norms
+    def calc_pairwise_norms(self, mod_pos):
+        pairwise_norms = np.zeros((len(mod_pos), len(mod_pos)))
 
-  def calc_pivot_zones(self, action, module_position):
-    if action < 49:
-      rangethingy = self.ranges[action]
-      offset_x = module_position[0] + rangethingy[0]
-      offset_y = module_position[1] + rangethingy[1]
-      offset_z = module_position[2] + rangethingy[2]
+        for mod in mod_pos.keys():
+            for mod2 in mod_pos.keys():
+                pairwise_norms[mod - 1][mod2 - 1] = norm(
+                    np.array(mod_pos[mod2]) - np.array(mod_pos[mod]), 2
+                )
 
-      if action < 17:
-        slice = np.expand_dims(self.free_zones[action], axis=2)
-      elif action < 33:
-        slice = np.expand_dims(self.free_zones[action], axis=1)
-      else:
-        slice = np.expand_dims(self.free_zones[action], axis=0)
+        return pairwise_norms
 
-      self.pivot_zone_grid_map[offset_x[0]:(offset_x[1] + 1), offset_y[0]:(offset_y[1] + 1), offset_z[0]:(offset_z[1] + 1)] = slice
-  
-  # once all modules have taken their action during the action phase, we will reset the pre_action_grid_map to curr_grid_map
-  def calc_pre_action_grid_map(self):
-    self.recenter()
-    self.edges = self.calculate_edges(self.modules, self.module_positions)
-    self.pre_action_grid_map = np.empty_like(self.curr_grid_map)
-    self.pivot_zone_grid_map = np.full(self.curr_grid_map.shape, True)
-    self.pre_action_grid_map[:] = self.curr_grid_map
-    self.pre_action_edges = self.edges.copy()
-    self.pre_action_articulation_points = set(self.articulationPoints(len(self.modules), self.pre_action_edges))
+    # Four-band reduction on rows
+    def calc_four_band_reduction(self, pairwise_norms):
+        """
+        Reduce n×n pairwise norms matrix to n×4 by extracting 4 diagonal bands.
 
-  # Calculate and return pairwise norms
-  def calc_pairwise_norms(self, mod_pos):
-    pairwise_norms = np.zeros((len(mod_pos), len(mod_pos)))
+        Always applies reduction regardless of n (required for curriculum learning
+        to maintain consistent observation size across different n values).
 
-    for mod in mod_pos.keys():
+        For n < 4, uses circular wrapping to fill all 4 bands.
+        """
+        n = pairwise_norms.shape[0]
 
-      for mod2 in mod_pos.keys():
+        # Always apply reduction to get (n, 4) output for curriculum learning
+        # Uses circular wrapping for boundary cases instead of 0.0 padding
+        # (0.0 would be confused with "at goal distance")
+        reduced_norms = np.zeros((n, 4))
 
-        pairwise_norms[mod-1][mod2-1] = norm(np.array(mod_pos[mod2]) - np.array(mod_pos[mod]), 2)
+        for i in range(n):
+            # Collect 4 bands: 2 before diagonal, 2 after diagonal
+            # Band offsets: -2, -1, +1, +2 relative to diagonal
+            # Use circular wrapping (modulo n) for boundary cases
+            bands = []
+            for offset in [-2, -1, 1, 2]:
+                j = (i + offset) % n  # Circular wrap
+                bands.append(pairwise_norms[i, j])
+            reduced_norms[i, :] = bands
 
-    return pairwise_norms
-  
-  # Four-band reduction on rows
-  def calc_four_band_reduction(self, pairwise_norms):
-    n = pairwise_norms.shape[0]
-    if n <= 5:
-      # For small assemblies, keep the full matrix to preserve information.
-      return pairwise_norms
+        return reduced_norms
 
-    # Apply reduction to get (n, 4) output
-    reduced_norms = np.zeros((n, 4))
+    # Local neighborhood reduction
+    # Reduce curr_mat to k rows CENTERED around the module of interest
+    def calc_local_neighborhood_reduction(self, curr_mat, module, k):
+        n = curr_mat.shape[0]
+        if n <= k:
+            return curr_mat
 
-    for i in range(n):
-      # Collect up to 4 bands: 2 before diagonal, 2 after diagonal
-      # Band -2, -1, +1, +2 relative to diagonal
-      bands = []
-      for offset in [-2, -1, 1, 2]:
-        j = i + offset
-        if 0 <= j < n:
-          bands.append(pairwise_norms[i, j])
-        else:
-          bands.append(0.0)
-      reduced_norms[i, :] = bands[:4]
+        # Convert to 0-indexed
+        module_idx = module - 1
 
-    return reduced_norms
-  
-  # Local neighborhood reduction
-  # Reduce curr_mat to k rows centered around the module of interest
-  def calc_local_neighborhood_reduction(self, curr_mat, module, k):
-    if curr_mat.shape[0] > k:
-      reduced_mat = np.zeros((k, curr_mat.shape[1]))
+        # Center the window around the acting module
+        # For k=5 and module_idx=3: half_k=2, so we get indices [-2,-1,0,1,2] relative to module
+        half_k = k // 2
 
-      if (module - 1) + (k - 1) >= curr_mat.shape[0]:
-        reduced_mat[0:(curr_mat.shape[0] - module + 1), :] = curr_mat[(module-1):, :]
-        reduced_mat[(curr_mat.shape[0] - module + 1):, :] = curr_mat[0:(k - (curr_mat.shape[0]-module+1)),:]
-      else:
-        reduced_mat = curr_mat[(module-1):(module-1+k)]
+        # Calculate centered indices with circular wrapping
+        # This ensures the acting module is always in the center of the observation
+        indices = []
+        for offset in range(-half_k, k - half_k):
+            idx = (module_idx + offset) % n
+            indices.append(idx)
 
-      return reduced_mat
-    return curr_mat
+        # Extract the k rows centered around the module
+        reduced_mat = curr_mat[indices, :]
 
-  # Squared distances matrix (integer on grid)
-  def compute_pairwise_sqdist(self, mod_pos):
-    n = len(mod_pos)
-    sq = np.zeros((n, n), dtype=int)
-    for i in mod_pos.keys():
-      pi = np.array(mod_pos[i])
-      for j in mod_pos.keys():
-        pj = np.array(mod_pos[j])
-        d = pj - pi
-        sq[i-1, j-1] = int(np.dot(d, d))
-    return sq
-  
-  # Calculate cost assignment matrix
-  def calc_cost_assignment_matrix(self, mat1, mat2):
-    cost_assignment_matrix = np.zeros(mat1.shape)
+        return reduced_mat
 
-    for i in range(mat1.shape[0]):
-      module1 = np.sort(mat1[i][:])
+    # Squared distances matrix (integer on grid)
+    def compute_pairwise_sqdist(self, mod_pos):
+        n = len(mod_pos)
+        sq = np.zeros((n, n), dtype=int)
+        for i in mod_pos.keys():
+            pi = np.array(mod_pos[i])
+            for j in mod_pos.keys():
+                pj = np.array(mod_pos[j])
+                d = pj - pi
+                sq[i - 1, j - 1] = int(np.dot(d, d))
+        return sq
 
-      for j in range(mat2.shape[0]):
-        module2 = np.sort(mat2[j][:])
-        cost_assignment_matrix[i][j] = sum((module2 - module1) ** 2)
-    return cost_assignment_matrix
-  
-  # Use Hungarian method to calculate assignment
-  def calc_assignment(self, cost_assignment_matrix):
-    indexes = self.m.compute(cost_assignment_matrix)
-    return indexes
-  
-  # Rearrange 2nd (presumably final) configuration matrix using assignment indices
-  def calc_rearranged_mat(self, indexes, mat):
-    rearranged_mat = np.zeros(mat.shape)
+    # Calculate cost assignment matrix
+    def calc_cost_assignment_matrix(self, mat1, mat2):
+        cost_assignment_matrix = np.zeros(mat1.shape)
 
-    for row, column in indexes:
-      for row2, column2 in indexes:
-        rearranged_mat[row][row2] = mat[column][column2]
+        for i in range(mat1.shape[0]):
+            module1 = np.sort(mat1[i][:])
 
-    return rearranged_mat
-  
-  # Calculate 2nd matrix with correct assignment
-  def calc_current_v_reassigned_final(self, mat1, mat2):
-    cost_assignment_matrix = self.calc_cost_assignment_matrix(mat1, mat2)
-    indexes = self.calc_assignment(cost_assignment_matrix)
-    rearranged_mat2 = self.calc_rearranged_mat(indexes, mat2)
-    return rearranged_mat2
-    
-  # Generate pair list and base bounty values (uniform by default)
-  def generate_pair_bounties(self, final_sqdist, base_value=1.0):
-    n = final_sqdist.shape[0]
-    pairs = []
-    base_vals = []
-    for i in range(n):
-      for j in range(i+1, n):
-        pairs.append((i, j))
-        base_vals.append(float(base_value))
-    return pairs, np.array(base_vals, dtype=float)
-  
-  def check_final(self, tol=1e-6):
-    #return np.allclose(self.final_pairwise_norms, self.curr_pairwise_norms, atol=tol)
-    return np.allclose(np.zeros(self.curr_pairwise_norms.shape), self.curr_pairwise_norms, atol=tol)
+            for j in range(mat2.shape[0]):
+                module2 = np.sort(mat2[j][:])
+                cost_assignment_matrix[i][j] = sum((module2 - module1) ** 2)
+        return cost_assignment_matrix
 
-  # need to calculate edges first
-  def calculate_edges(self, modules, module_positions):
-    edges = []
+    # Use Hungarian method to calculate assignment (scipy's Jonker-Volgenant is faster)
+    def calc_assignment(self, cost_assignment_matrix):
+        row_ind, col_ind = linear_sum_assignment(cost_assignment_matrix)
+        return list(zip(row_ind, col_ind))
 
-    for m in modules:
-      for n in range(m + 1, len(modules) + 1):
-        pos_m = module_positions[m]
-        pos_n = module_positions[n]
+    # Rearrange 2nd (presumably final) configuration matrix using assignment indices
+    def calc_rearranged_mat(self, indexes, mat):
+        rearranged_mat = np.zeros(mat.shape)
 
-        if np.sum(np.abs(np.subtract(pos_m, pos_n))) == 1:
-          edges.append([m-1,n-1])
+        for row, column in indexes:
+            for row2, column2 in indexes:
+                rearranged_mat[row][row2] = mat[column][column2]
 
-    # print("edges:")
-    # print(edges)
-    return edges
+        return rearranged_mat
 
+    # Calculate 2nd matrix with correct assignment (with caching for performance)
+    def calc_current_v_reassigned_final(self, mat1, mat2, force_recompute=False):
+        self._cache_step_counter += 1
 
-  def constructAdj(self, V, edges):
-      adj = [[] for _ in range(V)]
+        # Recompute if: forced, no cache, or interval reached
+        should_recompute = (
+            force_recompute
+            or self._cached_assignment is None
+            or self._cache_step_counter >= self._cache_update_interval
+        )
 
-      for edge in edges:
-          adj[edge[0]].append(edge[1])
-          adj[edge[1]].append(edge[0])
-      return adj
+        if should_recompute:
+            cost_assignment_matrix = self.calc_cost_assignment_matrix(mat1, mat2)
+            self._cached_assignment = self.calc_assignment(cost_assignment_matrix)
+            self._cache_step_counter = 0
 
-  # Helper function to perform DFS and find articulation points
-  # using Tarjan's algorithm.
-  def findPoints(self, adj, u, visited, disc, low, time, parent, isAP):
+        rearranged_mat2 = self.calc_rearranged_mat(self._cached_assignment, mat2)
+        return rearranged_mat2
 
-      # Mark vertex u as visited and assign discovery
-      # time and low value
-      visited[u] = 1
-      time[0] += 1
-      disc[u] = low[u] = time[0]
-      children = 0
+    def invalidate_assignment_cache(self):
+        """Call this at episode reset to force fresh assignment computation."""
+        self._cached_assignment = None
+        self._cache_step_counter = 0
 
-      # Process all adjacent vertices of u
-      for v in adj[u]:
+    # Generate pair list and base bounty values (uniform by default)
+    def generate_pair_bounties(self, final_sqdist, base_value=1.0):
+        n = final_sqdist.shape[0]
+        pairs = []
+        base_vals = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                pairs.append((i, j))
+                base_vals.append(float(base_value))
+        return pairs, np.array(base_vals, dtype=float)
 
-          # If v is not visited, then recursively visit it
-          if not visited[v]:
-              children += 1
-              self.findPoints(adj, v, visited, disc, low, time, u, isAP)
+    def check_final(self, tol=1e-6):
+        # return np.allclose(self.final_pairwise_norms, self.curr_pairwise_norms, atol=tol)
+        return np.allclose(
+            np.zeros(self.curr_pairwise_norms.shape), self.curr_pairwise_norms, atol=tol
+        )
 
-              # Check if the subtree rooted at v has a
-              # connection to one of the ancestors of u
-              low[u] = min(low[u], low[v])
+    # need to calculate edges first
+    def calculate_edges(self, modules, module_positions):
+        edges = []
 
-              # If u is not a root and low[v] is greater than or equal to disc[u],
-              # then u is an articulation point
-              if parent != -1 and low[v] >= disc[u]:
-                  isAP[u] = 1
+        for m in modules:
+            for n in range(m + 1, len(modules) + 1):
+                pos_m = module_positions[m]
+                pos_n = module_positions[n]
 
-          # Update low value of u for back edge
-          elif v != parent:
-              low[u] = min(low[u], disc[v])
+                if np.sum(np.abs(np.subtract(pos_m, pos_n))) == 1:
+                    edges.append([m - 1, n - 1])
 
-      # If u is root of DFS tree and has more than
-      # one child, it is an articulation point
-      if parent == -1 and children > 1:
-          isAP[u] = 1
+        # print("edges:")
+        # print(edges)
+        return edges
 
-  # Main function to find articulation points in the graph
-  def articulationPoints(self, V, edges):
+    def constructAdj(self, V, edges):
+        adj = [[] for _ in range(V)]
 
-      #ipdb.set_trace()
-      adj = self.constructAdj(V, edges)
-      # print("adjacency:")
-      # print(adj)
-      disc = [0] * V
-      low = [0] * V
-      visited = [0] * V
-      isAP = [0] * V
-      time = [0]
+        for edge in edges:
+            adj[edge[0]].append(edge[1])
+            adj[edge[1]].append(edge[0])
+        return adj
 
-      # Run DFS from each vertex if not
-      # already visited (to handle disconnected graphs)
-      for u in range(V):
-          if not visited[u]:
-              self.findPoints(adj, u, visited, disc, low, time, -1, isAP)
+    # Helper function to perform DFS and find articulation points
+    # using Tarjan's algorithm.
+    def findPoints(self, adj, u, visited, disc, low, time, parent, isAP):
+        # Mark vertex u as visited and assign discovery
+        # time and low value
+        visited[u] = 1
+        time[0] += 1
+        disc[u] = low[u] = time[0]
+        children = 0
 
-      # Collect all vertices that are articulation points
-      result = [u for u in range(V) if isAP[u]]
-      result = [x+1 for x in result]
+        # Process all adjacent vertices of u
+        for v in adj[u]:
+            # If v is not visited, then recursively visit it
+            if not visited[v]:
+                children += 1
+                self.findPoints(adj, v, visited, disc, low, time, u, isAP)
 
-      # If no articulation points are found, return list containing -1
-      return result if result else [-1]
+                # Check if the subtree rooted at v has a
+                # connection to one of the ancestors of u
+                low[u] = min(low[u], low[v])
+
+                # If u is not a root and low[v] is greater than or equal to disc[u],
+                # then u is an articulation point
+                if parent != -1 and low[v] >= disc[u]:
+                    isAP[u] = 1
+
+            # Update low value of u for back edge
+            elif v != parent:
+                low[u] = min(low[u], disc[v])
+
+        # If u is root of DFS tree and has more than
+        # one child, it is an articulation point
+        if parent == -1 and children > 1:
+            isAP[u] = 1
+
+    # Main function to find articulation points in the graph
+    def articulationPoints(self, V, edges):
+        # ipdb.set_trace()
+        adj = self.constructAdj(V, edges)
+        # print("adjacency:")
+        # print(adj)
+        disc = [0] * V
+        low = [0] * V
+        visited = [0] * V
+        isAP = [0] * V
+        time = [0]
+
+        # Run DFS from each vertex if not
+        # already visited (to handle disconnected graphs)
+        for u in range(V):
+            if not visited[u]:
+                self.findPoints(adj, u, visited, disc, low, time, -1, isAP)
+
+        # Collect all vertices that are articulation points
+        result = [u for u in range(V) if isAP[u]]
+        result = [x + 1 for x in result]
+
+        # If no articulation points are found, return list containing -1
+        return result if result else [-1]

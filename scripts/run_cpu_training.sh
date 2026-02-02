@@ -24,14 +24,21 @@ echo ""
 
 # ============================================
 # Stage-specific hyperparameters
+# Note: All stages use 85% rolling success rate as advancement threshold
 # ============================================
+
+# Rolling success window size (last N episodes)
+SUCCESS_WINDOW_SIZE=100
+
+# Target rolling success rate for advancement (85% for all stages)
+TARGET_ROLLING_SUCCESS="0.85"
+
 case $STAGE in
     4)
         MAX_STEPS=600
         EPISODES=2000
         LR="5e-4"
         ENTROPY="0.03"
-        TARGET_SUCCESS="0.90"
         MIN_EPISODES=500
         ;;
     5)
@@ -39,7 +46,6 @@ case $STAGE in
         EPISODES=2500
         LR="4.5e-4"
         ENTROPY="0.03"
-        TARGET_SUCCESS="0.88"
         MIN_EPISODES=500
         ;;
     6)
@@ -47,7 +53,6 @@ case $STAGE in
         EPISODES=2500
         LR="4e-4"
         ENTROPY="0.03"
-        TARGET_SUCCESS="0.85"
         MIN_EPISODES=600
         ;;
     7)
@@ -55,7 +60,6 @@ case $STAGE in
         EPISODES=3000
         LR="3.5e-4"
         ENTROPY="0.03"
-        TARGET_SUCCESS="0.80"
         MIN_EPISODES=600
         ;;
     8)
@@ -63,7 +67,6 @@ case $STAGE in
         EPISODES=5000
         LR="1e-4"
         ENTROPY="0.05"
-        TARGET_SUCCESS="0.65"
         MIN_EPISODES=1500
         ;;
     10)
@@ -71,7 +74,6 @@ case $STAGE in
         EPISODES=6000
         LR="8e-5"
         ENTROPY="0.04"
-        TARGET_SUCCESS="0.60"
         MIN_EPISODES=2000
         ;;
     12)
@@ -79,7 +81,6 @@ case $STAGE in
         EPISODES=7000
         LR="6e-5"
         ENTROPY="0.03"
-        TARGET_SUCCESS="0.55"
         MIN_EPISODES=2500
         ;;
     15)
@@ -87,7 +88,6 @@ case $STAGE in
         EPISODES=8000
         LR="5e-5"
         ENTROPY="0.025"
-        TARGET_SUCCESS="0.50"
         MIN_EPISODES=3000
         ;;
     20)
@@ -95,7 +95,6 @@ case $STAGE in
         EPISODES=10000
         LR="4e-5"
         ENTROPY="0.02"
-        TARGET_SUCCESS="0.45"
         MIN_EPISODES=4000
         ;;
     30)
@@ -103,7 +102,6 @@ case $STAGE in
         EPISODES=12000
         LR="3e-5"
         ENTROPY="0.015"
-        TARGET_SUCCESS="0.40"
         MIN_EPISODES=5000
         ;;
     50)
@@ -111,7 +109,6 @@ case $STAGE in
         EPISODES=15000
         LR="2e-5"
         ENTROPY="0.01"
-        TARGET_SUCCESS="0.35"
         MIN_EPISODES=6000
         ;;
     *)
@@ -120,6 +117,8 @@ case $STAGE in
         exit 1
         ;;
 esac
+
+echo "Target rolling success (last $SUCCESS_WINDOW_SIZE episodes): ${TARGET_ROLLING_SUCCESS}"
 
 # ============================================
 # Find previous model for curriculum
@@ -163,9 +162,9 @@ CMD="python train/train_sb3.py \
     --use_vec_normalize \
     --use_separate_networks \
     --hidden_dim 512 \
-    --target_success_rate $TARGET_SUCCESS \
+    --target_success_rate $TARGET_ROLLING_SUCCESS \
     --min_episodes $MIN_EPISODES \
-    --success_window_size 100 \
+    --success_window_size $SUCCESS_WINDOW_SIZE \
     --checkpoint_interval 500 \
     --num_envs $NUM_ENVS \
     --log_dir $LOG_DIR"
