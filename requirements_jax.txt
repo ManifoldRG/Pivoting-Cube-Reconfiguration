@@ -1,0 +1,25 @@
+# JAX/TPU requirements for accelerated training
+# Install on TPU VM: pip install -r requirements_jax.txt
+
+# JAX with TPU support
+jax[tpu]>=0.4.20
+jaxlib>=0.4.20
+
+# Neural network libraries
+flax>=0.7.0
+optax>=0.1.7
+distrax>=0.1.4
+
+# Core
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Utilities
+matplotlib>=3.7.0
+tensorboard>=2.13.0
+tqdm>=4.65.0
+chex>=0.1.7
+
+# For visualization
+pillow>=9.5.0
+imageio>=2.31.0

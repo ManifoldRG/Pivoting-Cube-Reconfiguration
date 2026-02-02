@@ -1,0 +1,21 @@
+# CPU-only requirements for TPU VM training (PyTorch/SB3)
+# Install: pip install -r requirements_cpu.txt
+
+# Core ML
+torch>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# RL Libraries
+stable-baselines3>=2.0.0
+sb3-contrib>=2.0.0
+gymnasium>=0.29.0
+
+# Utilities
+matplotlib>=3.7.0
+tensorboard>=2.13.0
+tqdm>=4.65.0
+
+# For visualization
+pillow>=9.5.0
+imageio>=2.31.0
