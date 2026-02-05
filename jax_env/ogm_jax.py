@@ -1,546 +1,1060 @@
 """
 JAX-based Occupancy Grid Map for TPU-accelerated training.
 
-This is a JAX reimplementation of the NumPy-based OccupancyGridMap for
-running on TPUs with PureJaxRL-style vectorized training.
+Faithful port of the NumPy OccupancyGridMap for use with PureJaxRL-style
+vectorized training on TPU.
 
-Key differences from NumPy version:
-- All operations use jax.numpy instead of numpy
-- State is immutable (functional updates)
-- JIT-compilable for maximum performance
-- Vectorizable via vmap for thousands of parallel environments
+Key design decisions:
+- All state is immutable (functional updates via NamedTuple._replace).
+- n (number of modules) is always a compile-time static constant; every
+  function that depends on n takes it via static_argnums or receives it
+  through a statically-shaped array.
+- The occupancy grid is stored ONLY as an (n,3) position array.  A dense
+  3D grid is reconstructed on-the-fly when pivot validation needs it.
+  This avoids storing/updating a large sparse grid in traced code.
+- Pivot validation uses pre-computed (48, 3, 3, 3) pattern tables that
+  are exact ports of potential_pivots / ranges from the NumPy version.
+- pivot_zone_grid_map is NOT ported (it is a minor optimisation in the
+  original that slightly restricts legal moves after a pivot; omitting it
+  makes the action space a superset of the NumPy version -- all moves the
+  NumPy code allows are still allowed, plus a few extra that the zone
+  mechanic would block).  This is acceptable for RL training.
+- Articulation-point detection uses BFS-based connectivity checking
+  (remove node, check reachability) which is JIT-compatible via lax.scan.
+- Hungarian assignment for unlabeled matching uses a JAX-compatible
+  implementation based on sorted-row signatures, which is exact for the
+  pairwise-norm distance matrices arising in this problem.
 """
 
 import jax
 import jax.numpy as jnp
 from jax import lax
 from functools import partial
-from typing import NamedTuple, Tuple, Optional
+from typing import NamedTuple, Tuple
 import chex
+import numpy as np
+
+
+# ============================================
+# Static lookup tables (numpy, converted to
+# JAX arrays at first use via _get_* helpers)
+# ============================================
+
+# --- Action deltas (48 pivots, 0-indexed) ---
+# Extracted directly from take_action() in occupancy_grid_map.py.
+# Row i  =>  action (i+1) in the NumPy code.
+# Action 48 (index 48) is the no-op; handled separately.
+_ACTION_DELTAS_NP = np.array(
+    [
+        # Actions  1- 4  (xy-plane, +x side)
+        [1, 0, 0],
+        [1, -1, 0],
+        [1, 0, 0],
+        [1, 1, 0],
+        # Actions  5- 8  (xy-plane, +y / -y)
+        [0, 1, 0],
+        [1, 1, 0],
+        [0, -1, 0],
+        [1, -1, 0],
+        # Actions  9-12  (xy-plane, -x side)
+        [-1, 0, 0],
+        [-1, -1, 0],
+        [-1, 0, 0],
+        [-1, 1, 0],
+        # Actions 13-16  (xy-plane, +y / -y other)
+        [0, 1, 0],
+        [-1, 1, 0],
+        [0, -1, 0],
+        [-1, -1, 0],
+        # Actions 17-20  (xz-plane, +x side)
+        [1, 0, 0],
+        [1, 0, -1],
+        [1, 0, 0],
+        [1, 0, 1],
+        # Actions 21-24  (xz-plane, +z / -z)
+        [0, 0, 1],
+        [1, 0, 1],
+        [0, 0, -1],
+        [1, 0, -1],
+        # Actions 25-28  (xz-plane, -x side)
+        [-1, 0, 0],
+        [-1, 0, -1],
+        [-1, 0, 0],
+        [-1, 0, 1],
+        # Actions 29-32  (xz-plane, +z / -z other)
+        [0, 0, 1],
+        [-1, 0, 1],
+        [0, 0, -1],
+        [-1, 0, -1],
+        # Actions 33-36  (yz-plane, +y side)
+        [0, 1, 0],
+        [0, 1, -1],
+        [0, 1, 0],
+        [0, 1, 1],
+        # Actions 37-40  (yz-plane, +z / -z)
+        [0, 0, 1],
+        [0, 1, 1],
+        [0, 0, -1],
+        [0, 1, -1],
+        # Actions 41-44  (yz-plane, -y side)
+        [0, -1, 0],
+        [0, -1, -1],
+        [0, -1, 0],
+        [0, -1, 1],
+        # Actions 45-48  (yz-plane, +z / -z other)
+        [0, 0, 1],
+        [0, -1, 1],
+        [0, 0, -1],
+        [0, -1, -1],
+    ],
+    dtype=np.int32,
+)  # shape (48, 3)
+
+NUM_ACTIONS = 49  # 48 pivots + 1 no-op (index 48)
+
+# --- Pivot validation tables ---
+# Each of the 48 pivot actions requires a specific occupancy pattern in a
+# 3D neighbourhood around the acting module.  The neighbourhood is defined
+# by PIVOT_OFFSETS (the corner closest to the module) and extends at most
+# 3 cells in each axis.  We pad everything to (48, 3, 3, 3) so shapes are
+# static.
+#
+# PIVOT_PATTERN[a, x, y, z] == 1  means that grid cell
+#     (module_pos + PIVOT_OFFSETS[a] + (x, y, z))
+#   must be OCCUPIED for action a to be valid.
+#
+# PIVOT_CHECK[a, x, y, z] == 1   means that cell is part of the validation
+#   region (cells outside are ignored).
+#
+# The validation rule is:
+#   for every (x,y,z) where PIVOT_CHECK[a]==1:
+#     occupied[cell] == bool(PIVOT_PATTERN[a, x, y, z])
+#   i.e. the actual occupancy in the check region must EXACTLY equal the
+#   pattern (both occupied AND empty cells must match).
+#
+# Generated by expanding potential_pivots[] / ranges[] from the NumPy code.
+
+_PIVOT_PATTERN_NP = np.array(
+    [
+        [
+            [[1, 0, 0], [1, 0, 0], [0, 0, 0]],
+            [[1, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 0, 0], [1, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [1, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[1, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[1, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[1, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [1, 0, 0], [0, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [1, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [1, 0, 0]],
+        ],
+        [
+            [[1, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 0], [0, 0, 0], [1, 0, 0]],
+            [[0, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [1, 0, 0], [1, 0, 0]],
+        ],
+        [
+            [[1, 0, 0], [1, 0, 0], [0, 0, 0]],
+            [[1, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[1, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 0, 0], [1, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [1, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 0], [0, 0, 0], [1, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [1, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 0], [0, 0, 0], [0, 0, 0]],
+            [[1, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 1], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[1, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[1, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[1, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 1, 0], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 1], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 1], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 1], [0, 0, 0], [0, 0, 0]],
+            [[0, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 1, 1], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 0], [0, 0, 0], [0, 0, 0]],
+            [[1, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[1, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 1, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 1], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 1], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 0], [1, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 1, 1], [0, 0, 1], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 0], [1, 0, 0], [1, 1, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 0], [0, 1, 0], [1, 1, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 0], [0, 0, 1], [0, 0, 1]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 0, 0], [1, 1, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 0], [0, 0, 0], [1, 1, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 1], [0, 1, 1], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 0], [0, 0, 0], [0, 1, 1]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 0], [1, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 0, 0], [1, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 0], [0, 1, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[0, 0, 1], [0, 0, 1], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+    ],
+    dtype=np.uint8,
+)  # (48, 3, 3, 3)
+
+_PIVOT_CHECK_NP = np.array(
+    [
+        [
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+        ],
+        [
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+        ],
+        [
+            [[1, 0, 0], [1, 0, 0], [0, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [0, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+        ],
+        [
+            [[1, 0, 0], [1, 0, 0], [0, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [0, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+        ],
+        [
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+        ],
+        [
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+        ],
+        [
+            [[1, 0, 0], [1, 0, 0], [0, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [0, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+        ],
+        [
+            [[1, 0, 0], [1, 0, 0], [0, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [0, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0]],
+        ],
+        [
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 0], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 0], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 0], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 0], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 0], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 0], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 0], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 0], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 1], [1, 1, 1], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 1], [1, 1, 1], [1, 1, 1]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 1], [1, 1, 1], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 1], [1, 1, 1], [1, 1, 1]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 0], [1, 1, 0], [1, 1, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 1], [1, 1, 1], [1, 1, 1]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 0], [1, 1, 0], [1, 1, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 1], [1, 1, 1], [1, 1, 1]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 1], [1, 1, 1], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 1], [1, 1, 1], [1, 1, 1]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 1], [1, 1, 1], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 1], [1, 1, 1], [1, 1, 1]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 0], [1, 1, 0], [1, 1, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 1], [1, 1, 1], [1, 1, 1]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 0], [1, 1, 0], [1, 1, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        [
+            [[1, 1, 1], [1, 1, 1], [1, 1, 1]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+    ],
+    dtype=np.uint8,
+)  # (48, 3, 3, 3)
+
+# Corner offset (relative to module position) for each action's 3x3x3 check window.
+_PIVOT_OFFSETS_NP = np.array(
+    [
+        [0, -1, 0],
+        [0, -1, 0],
+        [0, -1, 0],
+        [0, -1, 0],
+        [-1, 0, 0],
+        [-1, 0, 0],
+        [-1, -1, 0],
+        [-1, -2, 0],
+        [-1, -1, 0],
+        [-2, -1, 0],
+        [-1, -1, 0],
+        [-2, -1, 0],
+        [-1, 0, 0],
+        [-1, 0, 0],
+        [-1, -1, 0],
+        [-1, -2, 0],
+        [0, 0, -1],
+        [0, 0, -1],
+        [0, 0, -1],
+        [0, 0, -1],
+        [-1, 0, 0],
+        [-1, 0, 0],
+        [-1, 0, -1],
+        [-1, 0, -2],
+        [-1, 0, -1],
+        [-2, 0, -1],
+        [-1, 0, -1],
+        [-2, 0, -1],
+        [-1, 0, 0],
+        [-1, 0, 0],
+        [-1, 0, -1],
+        [-1, 0, -2],
+        [0, 0, -1],
+        [0, 0, -1],
+        [0, 0, -1],
+        [0, 0, -1],
+        [0, -1, 0],
+        [0, -1, 0],
+        [0, -1, -1],
+        [0, -1, -2],
+        [0, -1, -1],
+        [0, -2, -1],
+        [0, -1, -1],
+        [0, -2, -1],
+        [0, -1, 0],
+        [0, -1, 0],
+        [0, -1, -1],
+        [0, -1, -2],
+    ],
+    dtype=np.int32,
+)  # (48, 3)
+
+
+# ---- Eager JAX constant arrays (converted at import time, never inside JIT) ----
+# These are static lookup tables; converting them once at module load avoids
+# tracer-leak errors that occur if conversion happens inside a jit-traced call.
+ACTION_DELTAS = jnp.array(_ACTION_DELTAS_NP)  # (48, 3)  int32
+PIVOT_PATTERN = jnp.array(_PIVOT_PATTERN_NP)  # (48, 3, 3, 3) uint8
+PIVOT_CHECK = jnp.array(_PIVOT_CHECK_NP)  # (48, 3, 3, 3) uint8
+PIVOT_OFFSETS = jnp.array(_PIVOT_OFFSETS_NP)  # (48, 3)  int32
+
+
+def get_action_deltas():
+    return ACTION_DELTAS
+
+
+def get_pivot_pattern():
+    return PIVOT_PATTERN
+
+
+def get_pivot_check():
+    return PIVOT_CHECK
+
+
+def get_pivot_offsets():
+    return PIVOT_OFFSETS
 
 
 # ============================================
 # Data Structures
 # ============================================
 
+
 class OGMState(NamedTuple):
-    """Immutable state for the Occupancy Grid Map."""
-    module_positions: chex.Array  # (n, 3) - xyz positions of each module
-    final_positions: chex.Array   # (n, 3) - target positions
-    n: int                        # Number of modules
-    step_count: int               # Current step
-    max_steps: int                # Maximum steps per episode
+    """Immutable state for one environment instance."""
+
+    module_positions: chex.Array  # (n, 3) int32 - current positions
+    final_positions: chex.Array  # (n, 3) int32 - target positions
+    step_count: int  # current step (scalar int32)
+    max_steps: int  # episode length limit (scalar int32)
+    # agent_idx tracks whose turn it is (round-robin)
+    agent_idx: int  # scalar int32
 
 
 class OGMConfig(NamedTuple):
-    """Configuration for the environment (static, not traced)."""
-    n: int                        # Number of modules
-    max_steps: int                # Maximum steps per episode
-    grid_size: int                # Size of the grid (default 50x50)
-    use_unlabeled: bool           # Whether to use unlabeled rewards
-    local_k: int                  # Local neighborhood size
+    """Static (non-traced) configuration."""
+
+    n: int
+    max_steps: int
+    grid_size: int  # half-width for the dense grid used in validation
+    use_unlabeled: bool
+    local_k: int
 
 
 # ============================================
-# Actions
+# Utility: build a dense occupancy grid from
+# (n,3) positions.  grid_size must be large
+# enough that all positions fit inside
+# [0, 2*grid_size).
 # ============================================
 
-# 48 pivot actions + 1 no-op = 49 total
-# Each action is (axis, direction, rotation_direction)
-# axis: 0=x, 1=y, 2=z
-# direction: -1 or +1 (which side of cube)
-# rotation: -1 or +1 (which way to rotate)
 
-# Pre-computed action deltas for all 48 pivot moves
-# Shape: (48, 3) - displacement in x, y, z for each action
-# NOTE: Using numpy array at module level to avoid JAX initialization at import time
-# This is converted to JAX array lazily when first used
-import numpy as np
+@partial(jax.jit, static_argnums=(1,))
+def _build_grid(positions: chex.Array, grid_size: int) -> chex.Array:
+    """Return a (2*gs, 2*gs, 2*gs) bool grid marking occupied cells."""
+    side = 2 * grid_size
+    grid = jnp.zeros((side, side, side), dtype=jnp.bool_)
 
-_ACTION_DELTAS_NP = np.array([
-    # X-axis pivots (16 actions)
-    [-1, -1, -1], [-1, -1, 0], [-1, -1, 1], [-1, 0, -1],
-    [-1, 0, 1], [-1, 1, -1], [-1, 1, 0], [-1, 1, 1],
-    [1, -1, -1], [1, -1, 0], [1, -1, 1], [1, 0, -1],
-    [1, 0, 1], [1, 1, -1], [1, 1, 0], [1, 1, 1],
-    # Y-axis pivots (16 actions)
-    [-1, -1, -1], [-1, -1, 1], [-1, 0, -1], [-1, 0, 1],
-    [-1, 1, -1], [-1, 1, 1], [0, -1, -1], [0, -1, 1],
-    [0, 1, -1], [0, 1, 1], [1, -1, -1], [1, -1, 1],
-    [1, 0, -1], [1, 0, 1], [1, 1, -1], [1, 1, 1],
-    # Z-axis pivots (16 actions)
-    [-1, -1, -1], [-1, -1, 0], [-1, -1, 1], [-1, 0, -1],
-    [-1, 0, 1], [-1, 1, -1], [-1, 1, 0], [-1, 1, 1],
-    [1, -1, -1], [1, -1, 0], [1, -1, 1], [1, 0, -1],
-    [1, 0, 1], [1, 1, -1], [1, 1, 0], [1, 1, 1],
-], dtype=np.int32)
+    # scatter True at each position
+    def _set(g, pos):
+        return g.at[pos[0], pos[1], pos[2]].set(True), None
 
-NUM_ACTIONS = 49  # 48 pivot + 1 no-op
-
-# Lazy initialization of JAX array
-_ACTION_DELTAS_JAX = None
-
-def get_action_deltas():
-    """Get ACTION_DELTAS as a JAX array (lazy initialization)."""
-    global _ACTION_DELTAS_JAX
-    if _ACTION_DELTAS_JAX is None:
-        _ACTION_DELTAS_JAX = jnp.array(_ACTION_DELTAS_NP)
-    return _ACTION_DELTAS_JAX
+    grid, _ = lax.scan(_set, grid, positions)
+    return grid
 
 
 # ============================================
-# Core Functions
+# Core: pairwise norms
 # ============================================
+
 
 @jax.jit
 def compute_pairwise_norms(positions: chex.Array) -> chex.Array:
-    """
-    Compute pairwise L2 distances between all module positions.
-    
-    Args:
-        positions: (n, 3) array of module positions
-        
-    Returns:
-        (n, n) array of pairwise distances
-    """
-    # Expand dimensions for broadcasting
-    pos_i = positions[:, None, :]  # (n, 1, 3)
-    pos_j = positions[None, :, :]  # (1, n, 3)
-    
-    # Compute squared differences
-    diff = pos_i - pos_j  # (n, n, 3)
-    sq_dist = jnp.sum(diff ** 2, axis=-1)  # (n, n)
-    
-    return jnp.sqrt(sq_dist)
+    """(n,3) -> (n,n) L2 distances."""
+    diff = positions[:, None, :] - positions[None, :, :]  # (n, n, 3)
+    return jnp.sqrt(jnp.sum(diff * diff, axis=-1))
 
 
-@jax.jit
-def compute_relative_norms(current: chex.Array, target: chex.Array) -> chex.Array:
-    """
-    Compute element-wise difference between current and target pairwise norms.
-    
-    Args:
-        current: (n, n) current pairwise distances
-        target: (n, n) target pairwise distances
-        
-    Returns:
-        (n, n) relative distances (0 means at target)
-    """
-    return jnp.abs(current - target)
+# ============================================
+# Observation reductions (four-band + local-k)
+# ============================================
 
 
 @jax.jit
 def calc_four_band_reduction(pairwise_norms: chex.Array) -> chex.Array:
-    """
-    Reduce n×n pairwise norms to n×4 using diagonal bands.
-    
-    This maintains a constant observation size across different n values,
-    which is critical for curriculum learning.
-    
-    Args:
-        pairwise_norms: (n, n) pairwise distance matrix
-        
-    Returns:
-        (n, 4) reduced observation
-    """
+    """(n,n) -> (n,4).  Offsets [-2,-1,+1,+2] with circular wrapping."""
     n = pairwise_norms.shape[0]
-    
-    def get_band_value(i: int, offset: int) -> float:
-        j = (i + offset) % n
-        return pairwise_norms[i, j]
-    
-    # Extract 4 bands: offsets -2, -1, +1, +2
+    idx = jnp.arange(n)
     bands = []
     for offset in [-2, -1, 1, 2]:
-        band = jax.vmap(lambda i: pairwise_norms[i, (i + offset) % n])(jnp.arange(n))
-        bands.append(band)
-    
+        j = (idx + offset) % n
+        bands.append(pairwise_norms[idx, j])  # (n,)
     return jnp.stack(bands, axis=1)  # (n, 4)
 
 
 @partial(jax.jit, static_argnums=(2,))
-def calc_local_neighborhood(
-    reduced_norms: chex.Array,
-    agent_idx: int,
-    k: int
-) -> chex.Array:
-    """
-    Extract local neighborhood centered on the acting agent.
-    
-    Args:
-        reduced_norms: (n, 4) four-band reduced observation
-        agent_idx: Index of the acting agent (0-indexed)
-        k: Size of local neighborhood
-        
-    Returns:
-        (k, 4) local neighborhood observation
-    """
-    n = reduced_norms.shape[0]
+def calc_local_neighborhood(reduced: chex.Array, agent_idx: int, k: int) -> chex.Array:
+    """(n, 4) -> (k, 4) window centred on agent_idx."""
+    n = reduced.shape[0]
     half_k = k // 2
-    
-    # Generate indices centered around agent
-    offsets = jnp.arange(k) - half_k
+    offsets = jnp.arange(k) - half_k  # (-half_k .. k-half_k-1)
     indices = (agent_idx + offsets) % n
-    
-    return reduced_norms[indices]
-
-
-@jax.jit
-def get_neighbors(positions: chex.Array, idx: int) -> chex.Array:
-    """
-    Get mask of which modules are neighbors (Manhattan distance = 1).
-    
-    Args:
-        positions: (n, 3) module positions
-        idx: Index of module to check neighbors for
-        
-    Returns:
-        (n,) boolean mask of neighbors
-    """
-    pos = positions[idx]
-    diffs = jnp.abs(positions - pos)
-    manhattan = jnp.sum(diffs, axis=1)
-    
-    # Neighbor if Manhattan distance is exactly 1
-    return (manhattan == 1)
-
-
-@jax.jit
-def check_connectivity(positions: chex.Array) -> bool:
-    """
-    Check if all modules form a single connected component.
-    Uses iterative BFS that's JAX-compatible.
-    
-    Args:
-        positions: (n, 3) module positions
-        
-    Returns:
-        True if connected, False otherwise
-    """
-    n = positions.shape[0]
-    
-    # Build adjacency matrix
-    def is_neighbor(i, j):
-        diff = jnp.abs(positions[i] - positions[j])
-        return jnp.sum(diff) == 1
-    
-    adj = jax.vmap(lambda i: jax.vmap(lambda j: is_neighbor(i, j))(jnp.arange(n)))(jnp.arange(n))
-    
-    # BFS using matrix multiplication
-    visited = jnp.zeros(n, dtype=jnp.bool_)
-    visited = visited.at[0].set(True)
-    
-    def bfs_step(visited, _):
-        # Expand to neighbors
-        new_visited = jnp.any(adj & visited[None, :], axis=1) | visited
-        return new_visited, None
-    
-    visited, _ = lax.scan(bfs_step, visited, None, length=n)
-    
-    return jnp.all(visited)
-
-
-@jax.jit
-def is_articulation_point(positions: chex.Array, idx: int) -> bool:
-    """
-    Check if removing a module disconnects the graph.
-    
-    Args:
-        positions: (n, 3) module positions
-        idx: Index of module to check
-        
-    Returns:
-        True if module is an articulation point
-    """
-    n = positions.shape[0]
-    
-    # Create mask excluding the module
-    mask = jnp.arange(n) != idx
-    remaining_positions = positions[mask]
-    
-    # Check if remaining modules are connected
-    return ~check_connectivity(remaining_positions)
-
-
-@jax.jit
-def get_action_mask(
-    state: OGMState,
-    agent_idx: int
-) -> chex.Array:
-    """
-    Compute valid action mask for an agent.
-    
-    Args:
-        state: Current environment state
-        agent_idx: Index of the acting agent
-        
-    Returns:
-        (49,) boolean mask of valid actions
-    """
-    positions = state.module_positions
-    
-    # Check each pivot action using JAX-compatible logic
-    def check_action(action_idx: int) -> bool:
-        delta = get_action_deltas()[action_idx]
-        new_pos = positions[agent_idx] + delta
-        
-        # Check: Position not already occupied
-        occupied = jnp.any(jnp.all(positions == new_pos, axis=1))
-        
-        # Valid if within pivot actions (0-47) and not occupied
-        # Action 48 (no-op) is always valid
-        is_noop = action_idx >= 48
-        return is_noop | (~occupied)
-    
-    mask = jax.vmap(check_action)(jnp.arange(NUM_ACTIONS))
-    
-    return mask
+    return reduced[indices]  # (k, 4)
 
 
 # ============================================
-# Environment Step
+# Connectivity & articulation-point detection
 # ============================================
+
+
+@partial(jax.jit, static_argnums=(1,))
+def _build_adjacency(positions: chex.Array, n: int) -> chex.Array:
+    """Return (n,n) bool adjacency matrix (Manhattan dist == 1)."""
+    diff = positions[:, None, :] - positions[None, :, :]  # (n,n,3)
+    manhattan = jnp.sum(jnp.abs(diff), axis=-1)  # (n,n)
+    return manhattan == 1  # (n,n) bool
+
 
 @partial(jax.jit, static_argnums=(2,))
-def step(
-    state: OGMState,
-    action: int,
-    agent_idx: int
-) -> Tuple[OGMState, chex.Array, bool, bool, dict]:
+def _bfs_reachable(adj: chex.Array, start: int, n: int) -> chex.Array:
+    """BFS from `start` using matrix-power expansion.  Returns (n,) bool visited."""
+    visited = jnp.zeros(n, dtype=jnp.bool_).at[start].set(True)
+
+    def _step(visited, _):
+        # any neighbour of a visited node becomes visited
+        new_visited = jnp.any(adj & visited[None, :], axis=1) | visited
+        return new_visited, None
+
+    visited, _ = lax.scan(_step, visited, None, length=n)
+    return visited
+
+
+@partial(jax.jit, static_argnums=(1,))
+def is_articulation_point(positions: chex.Array, n: int) -> chex.Array:
+    """Return (n,) bool array: True where module is an articulation point.
+
+    A module is an AP if removing it disconnects the remaining graph.
+    We check this by: for each candidate i, mask row/col i out of the
+    adjacency matrix, pick the first remaining node as BFS root, and
+    check if all other remaining nodes are reached.
     """
-    Execute one step in the environment.
-    
-    Args:
-        state: Current state
-        action: Action to take (0-48)
-        agent_idx: Which agent is acting
-        
-    Returns:
-        Tuple of (new_state, reward, terminated, truncated, info)
-    """
-    positions = state.module_positions
-    
-    # Apply action
-    new_positions = lax.cond(
-        action < 48,
-        lambda: positions.at[agent_idx].add(get_action_deltas()[action]),
-        lambda: positions
-    )
-    
-    # Update state
-    new_state = state._replace(
-        module_positions=new_positions,
-        step_count=state.step_count + 1
-    )
-    
-    # Compute reward (will be expanded below)
-    reward = compute_reward(state, new_state)
-    
-    # Check termination
-    done = check_success(new_state)
-    truncated = new_state.step_count >= new_state.max_steps
-    
-    info = {"success": done}
-    
-    return new_state, reward, done, truncated, info
+    adj = _build_adjacency(positions, n)  # (n,n)
+
+    def _check_one(i):
+        # mask out node i
+        mask = jnp.arange(n) != i  # (n,) bool
+        adj_masked = adj & mask[:, None] & mask[None, :]  # zero row & col i
+
+        # BFS root: first node that is not i
+        # Use (i+1) % n so it wraps around
+        root = (i + 1) % n
+
+        visited = _bfs_reachable(adj_masked, root, n)  # (n,)
+
+        # All nodes except i must be visited
+        expected = mask  # (n,) True everywhere except i
+        return ~jnp.all(visited == expected)  # True => disconnected => AP
+
+    return jax.vmap(_check_one)(jnp.arange(n))  # (n,)
 
 
 # ============================================
-# Reward Functions
+# Pivot validation (action mask)
 # ============================================
 
-@jax.jit
-def compute_potential(state: OGMState, use_unlabeled: bool = True) -> float:
+
+@partial(jax.jit, static_argnums=(1, 2))
+def get_action_mask(positions: chex.Array, n: int, grid_size: int) -> chex.Array:
+    """Return (49,) bool mask of valid actions for agent at positions[agent_idx].
+
+    Checks:
+      1. Module must NOT be an articulation point.
+      2. For each of the 48 pivot actions, the 3x3x3 neighbourhood occupancy
+         must exactly match the pre-computed PIVOT_PATTERN (ports the
+         potential_pivots check from the NumPy version).
+      3. Action 48 (no-op) is always valid.
+
+    agent_idx is encoded implicitly: this function returns the mask for
+    agent 0.  The caller rotates the position array so that the acting
+    agent is always index 0 -- see _rotate_for_agent().
     """
-    Compute potential-based reward.
-    
-    Args:
-        state: Current state
-        use_unlabeled: Whether to use unlabeled (shape) matching
-        
-    Returns:
-        Potential value (lower is better, 0 is optimal)
-    """
-    curr_norms = compute_pairwise_norms(state.module_positions)
-    final_norms = compute_pairwise_norms(state.final_positions)
-    
-    if use_unlabeled:
-        # Use sorted signatures for unlabeled matching
-        curr_sorted = jnp.sort(curr_norms, axis=1)
-        final_sorted = jnp.sort(final_norms, axis=1)
-        diff = jnp.abs(curr_sorted - final_sorted)
-    else:
-        diff = jnp.abs(curr_norms - final_norms)
-    
-    return jnp.sum(diff)
+    # --- build dense grid ---
+    # Shift positions so minimum is at least 2 (buffer for negative offsets
+    # in PIVOT_OFFSETS which go down to -2).
+    # We use a fixed shift of grid_size so that positions land in the middle.
+    shifted = positions + grid_size  # (n, 3) int32
+    side = 2 * grid_size
+    grid = _build_grid(shifted, grid_size)  # (side,side,side) bool
+
+    # --- articulation point for agent 0 ---
+    ap_mask = is_articulation_point(positions, n)  # (n,)
+    agent_is_ap = ap_mask[0]  # scalar bool
+
+    # --- pattern check for all 48 actions ---
+    agent_pos = shifted[0]  # (3,) shifted position of agent 0
+
+    pattern = get_pivot_pattern()  # (48, 3, 3, 3) uint8
+    check = get_pivot_check()  # (48, 3, 3, 3) uint8
+    offsets = get_pivot_offsets()  # (48, 3) int32
+
+    def _check_action(a):
+        """Check one pivot action a in [0..47]."""
+        # Corner of the 3x3x3 window in the shifted grid
+        corner = agent_pos + offsets[a]  # (3,)
+
+        # Extract the 3x3x3 sub-grid.  Use dynamic_slice (JIT-safe).
+        sub = lax.dynamic_slice(grid, corner, (3, 3, 3))  # (3,3,3) bool
+
+        # Compare: where check==1, sub must equal pattern
+        pat = pattern[a].astype(jnp.bool_)  # (3,3,3)
+        chk = check[a].astype(jnp.bool_)  # (3,3,3)
+
+        # Mismatch at any checked cell => invalid
+        mismatch = chk & (sub != pat)
+        return ~jnp.any(mismatch)  # True => valid
+
+    pivot_valid = jax.vmap(_check_action)(jnp.arange(48))  # (48,) bool
+
+    # If agent is AP, no pivot is valid
+    pivot_valid = jnp.where(agent_is_ap, jnp.zeros(48, dtype=jnp.bool_), pivot_valid)
+
+    # Append no-op (always valid)
+    return jnp.concatenate([pivot_valid, jnp.array([True])])  # (49,)
+
+
+# ============================================
+# Success check (unlabeled: sorted-row
+# signature matching, equivalent to the
+# Hungarian-based check for distance matrices)
+# ============================================
 
 
 @jax.jit
+def check_success(
+    module_positions: chex.Array, final_positions: chex.Array, tol: float = 1e-6
+) -> bool:
+    """True if the current shape matches the target (up to rigid motion)."""
+    curr = compute_pairwise_norms(module_positions)
+    final = compute_pairwise_norms(final_positions)
+    # Sort each row -> canonical shape signature
+    curr_sorted = jnp.sort(curr, axis=1)
+    final_sorted = jnp.sort(final, axis=1)
+    # Sort the rows themselves so the signature is permutation-invariant
+    curr_sig = jnp.sort(curr_sorted, axis=0)
+    final_sig = jnp.sort(final_sorted, axis=0)
+    return jnp.allclose(curr_sig, final_sig, atol=tol)
+
+
+# ============================================
+# Reward / potential
+# ============================================
+
+
+@jax.jit
+def compute_potential(
+    module_positions: chex.Array, final_positions: chex.Array
+) -> float:
+    """Potential Phi(s) = - sum |curr_sorted - final_sorted| (row-wise).
+
+    Lower (closer to 0) is better; Phi == 0 at success.
+    """
+    curr = compute_pairwise_norms(module_positions)
+    final = compute_pairwise_norms(final_positions)
+    curr_sorted = jnp.sort(curr, axis=1)
+    final_sorted = jnp.sort(final, axis=1)
+    # Sort rows for permutation invariance (matches check_success logic)
+    curr_sig = jnp.sort(curr_sorted, axis=0)
+    final_sig = jnp.sort(final_sorted, axis=0)
+    return jnp.sum(jnp.abs(curr_sig - final_sig))
+
+
+@partial(jax.jit, static_argnums=())
 def compute_reward(
-    prev_state: OGMState,
-    curr_state: OGMState,
+    prev_positions: chex.Array,
+    curr_positions: chex.Array,
+    final_positions: chex.Array,
     step_cost: float = -0.005,
     potential_scale: float = 1.0,
-    success_bonus: float = 100.0
+    success_bonus: float = 100.0,
 ) -> float:
-    """
-    Compute shaped reward for transition.
-    
-    Args:
-        prev_state: Previous state
-        curr_state: Current state
-        step_cost: Per-step penalty
-        potential_scale: Scale for potential-based shaping
-        success_bonus: Reward for reaching goal
-        
-    Returns:
-        Total reward
-    """
-    # Base step cost
-    reward = step_cost
-    
-    # Potential-based shaping (F = gamma * phi' - phi)
-    prev_potential = compute_potential(prev_state)
-    curr_potential = compute_potential(curr_state)
-    shaping = potential_scale * (prev_potential - curr_potential)
-    reward += shaping
-    
-    # Success bonus
-    done = check_success(curr_state)
-    reward = lax.cond(done, lambda: reward + success_bonus, lambda: reward)
-    
-    return reward
+    """Shaped reward: step_cost + potential shaping + success bonus."""
+    prev_phi = compute_potential(prev_positions, final_positions)
+    curr_phi = compute_potential(curr_positions, final_positions)
 
+    shaping = potential_scale * (prev_phi - curr_phi)  # positive when improving
+    done = check_success(curr_positions, final_positions)
+    bonus = jnp.where(done, success_bonus, 0.0)
 
-@jax.jit
-def check_success(state: OGMState, tol: float = 1e-6) -> bool:
-    """
-    Check if goal configuration is reached.
-    
-    Uses unlabeled matching: checks if pairwise distance signatures match.
-    """
-    curr_norms = compute_pairwise_norms(state.module_positions)
-    final_norms = compute_pairwise_norms(state.final_positions)
-    
-    # Sort each row to get shape signatures
-    curr_sorted = jnp.sort(curr_norms, axis=1)
-    final_sorted = jnp.sort(final_norms, axis=1)
-    
-    # Check if signatures match
-    return jnp.allclose(curr_sorted, final_sorted, atol=tol)
+    return step_cost + shaping + bonus
 
 
 # ============================================
-# Reset / Initialization
+# Random connected configuration generator
 # ============================================
 
-def make_connected_configuration(
-    key: chex.PRNGKey,
-    n: int,
-    grid_size: int = 50
-) -> chex.Array:
+
+@partial(jax.jit, static_argnums=(1,))
+def make_connected_configuration(key: chex.PRNGKey, n: int) -> chex.Array:
+    """Grow a random connected structure of n cubes via BFS-style growth.
+
+    Returns (n, 3) int32 positions centred near the origin.
     """
-    Generate a random connected configuration of n modules.
-    
-    This implementation is JAX-traceable by using static shapes and masking.
-    
-    Args:
-        key: JAX random key
-        n: Number of modules
-        grid_size: Size of the grid
-        
-    Returns:
-        (n, 3) array of positions
-    """
-    center = grid_size // 2
-    
-    # Pre-allocate positions array
-    positions = jnp.zeros((n, 3), dtype=jnp.int32)
-    positions = positions.at[0].set(jnp.array([center, center, center]))
-    
-    # Valid mask - which positions are filled
-    valid_mask = jnp.zeros(n, dtype=jnp.bool_)
-    valid_mask = valid_mask.at[0].set(True)
-    
-    # 6 possible neighbor directions
-    DELTAS = jnp.array([
-        [1, 0, 0], [-1, 0, 0],
-        [0, 1, 0], [0, -1, 0],
-        [0, 0, 1], [0, 0, -1]
-    ], dtype=jnp.int32)
-    
-    def add_module(carry, key):
-        positions, valid_mask, count = carry
-        
-        # For each existing position, compute all 6 neighbors
+    # 6 face-adjacent directions
+    DIRS = jnp.array(
+        [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]],
+        dtype=jnp.int32,
+    )
+
+    # Start at origin
+    positions = jnp.zeros((n, 3), dtype=jnp.int32)  # pre-allocated
+    filled = jnp.zeros(n, dtype=jnp.bool_).at[0].set(True)
+
+    def _add_one(carry, key_i):
+        positions, filled, count = carry
+
+        # For every filled position, compute 6 candidate neighbours
         # Shape: (n, 6, 3)
-        all_neighbors = positions[:, None, :] + DELTAS[None, :, :]
-        
-        # Flatten to (n * 6, 3)
-        all_neighbors_flat = all_neighbors.reshape(-1, 3)
-        
-        # Create mask for which neighbor slots are valid (from filled positions)
-        # Shape: (n, 6) -> (n * 6,)
-        from_valid = jnp.repeat(valid_mask, 6)
-        
-        # Check which positions are NOT already occupied
-        def is_free(pos):
-            # Check against all positions (using valid_mask to ignore empty slots)
-            matches = jnp.all(positions == pos, axis=1) & valid_mask
+        candidates = positions[:, None, :] + DIRS[None, :, :]
+        candidates_flat = candidates.reshape(-1, 3)  # (n*6, 3)
+
+        # Mask: candidate comes from a filled slot
+        from_filled = jnp.repeat(filled, 6)  # (n*6,)
+
+        # Mask: candidate is not already occupied
+        def _is_free(pos):
+            matches = jnp.all(positions == pos[None, :], axis=1) & filled
             return ~jnp.any(matches)
-        
-        free_mask = jax.vmap(is_free)(all_neighbors_flat)
-        
-        # Combined mask: from valid position AND the target is free
-        candidate_mask = from_valid & free_mask
-        
-        # Create probability distribution (uniform over valid candidates)
-        probs = candidate_mask.astype(jnp.float32)
-        probs = probs / (probs.sum() + 1e-8)
-        
-        # Sample a position
-        num_candidates = n * 6
-        idx = jax.random.choice(key, num_candidates, p=probs)
-        new_pos = all_neighbors_flat[idx]
-        
-        # Add to positions at the current count
+
+        free_mask = jax.vmap(_is_free)(candidates_flat)  # (n*6,)
+
+        valid = from_filled & free_mask  # (n*6,)
+
+        # Sample uniformly among valid candidates
+        logits = jnp.where(valid, 0.0, -1e9)
+        idx = jax.random.categorical(key_i, logits)
+
+        new_pos = candidates_flat[idx]  # (3,)
         positions = positions.at[count].set(new_pos)
-        valid_mask = valid_mask.at[count].set(True)
-        
-        return (positions, valid_mask, count + 1), None
-    
-    # Run scan to add n-1 modules
+        filled = filled.at[count].set(True)
+
+        return (positions, filled, count + 1), None
+
     keys = jax.random.split(key, n - 1)
-    (positions, _, _), _ = lax.scan(add_module, (positions, valid_mask, 1), keys)
-    
+    (positions, _, _), _ = lax.scan(_add_one, (positions, filled, 1), keys)
+
     return positions
 
 
-def reset(
-    key: chex.PRNGKey,
-    config: OGMConfig
-) -> OGMState:
-    """
-    Reset environment to a new random configuration.
-    
-    Args:
-        key: JAX random key
-        config: Environment configuration
-        
-    Returns:
-        Initial state
-    """
+# ============================================
+# Environment reset
+# ============================================
+
+
+@partial(jax.jit, static_argnums=(1,))
+def reset(key: chex.PRNGKey, config: OGMConfig) -> OGMState:
+    """Create a fresh episode with random initial & target configurations."""
     key1, key2 = jax.random.split(key)
-    
-    initial_positions = make_connected_configuration(key1, config.n)
-    final_positions = make_connected_configuration(key2, config.n)
-    
+    init_pos = make_connected_configuration(key1, config.n)
+    final_pos = make_connected_configuration(key2, config.n)
+
     return OGMState(
-        module_positions=initial_positions,
-        final_positions=final_positions,
-        n=config.n,
-        step_count=0,
-        max_steps=config.max_steps
+        module_positions=init_pos,
+        final_positions=final_pos,
+        step_count=jnp.int32(0),
+        max_steps=jnp.int32(config.max_steps),
+        agent_idx=jnp.int32(0),
     )
 
 
@@ -548,93 +1062,156 @@ def reset(
 # Observation
 # ============================================
 
-@partial(jax.jit, static_argnums=(2, 3))
+
+@partial(jax.jit, static_argnums=(3,))
 def get_observation(
-    state: OGMState,
+    module_positions: chex.Array,
+    final_positions: chex.Array,
     agent_idx: int,
-    use_four_band: bool = True,
-    local_k: int = 7
+    local_k: int,
 ) -> chex.Array:
+    """Flat observation vector of size (local_k * 4 + 4).
+
+    Components:
+      - four-band reduction of |curr_norms - final_norms|, local window of k rows
+      - 4-dim sinusoidal agent encoding
     """
-    Get observation for an agent.
-    
-    Args:
-        state: Current state
-        agent_idx: Which agent is observing
-        use_four_band: Whether to use four-band reduction
-        local_k: Size of local neighborhood
-        
-    Returns:
-        Flat observation array
-    """
-    # Compute relative pairwise norms
-    curr_norms = compute_pairwise_norms(state.module_positions)
-    final_norms = compute_pairwise_norms(state.final_positions)
-    rel_norms = compute_relative_norms(curr_norms, final_norms)
-    
-    # Apply four-band reduction
-    if use_four_band:
-        rel_norms = calc_four_band_reduction(rel_norms)
-    
-    # Apply local neighborhood
-    obs = calc_local_neighborhood(rel_norms, agent_idx, local_k)
-    
-    # Flatten and normalize
-    obs = obs.flatten()
-    max_dist = jnp.sqrt(3.0) * 50  # Max possible distance in grid
+    n = module_positions.shape[0]
+
+    curr_norms = compute_pairwise_norms(module_positions)
+    final_norms = compute_pairwise_norms(final_positions)
+    rel_norms = jnp.abs(curr_norms - final_norms)  # (n, n)
+
+    reduced = calc_four_band_reduction(rel_norms)  # (n, 4)
+    local = calc_local_neighborhood(reduced, agent_idx, local_k)  # (k, 4)
+
+    obs = local.flatten()  # (k*4,)
+
+    # Normalise by max possible grid distance
+    max_dist = jnp.sqrt(3.0) * 50.0
     obs = obs / max_dist
-    
-    # Add agent encoding (fixed size = 4)
-    agent_encoding = jnp.array([
-        jnp.sin(2 * jnp.pi * agent_idx / state.n),
-        jnp.cos(2 * jnp.pi * agent_idx / state.n),
-        agent_idx / state.n,
-        (state.n - agent_idx) / state.n
-    ])
-    
-    return jnp.concatenate([obs, agent_encoding])
+
+    # Agent encoding (4 dims, fixed size)
+    n_f = jnp.float32(n)
+    idx_f = jnp.float32(agent_idx)
+    agent_enc = jnp.array(
+        [
+            jnp.sin(2.0 * jnp.pi * idx_f / n_f),
+            jnp.cos(2.0 * jnp.pi * idx_f / n_f),
+            idx_f / n_f,
+            (n_f - idx_f) / n_f,
+        ]
+    )
+
+    return jnp.concatenate([obs, agent_enc])  # (k*4 + 4,)
 
 
 # ============================================
-# Vectorized Environment (for PureJaxRL)
+# Environment step
 # ============================================
+
+
+@partial(jax.jit, static_argnums=(2, 3))
+def step_with_action(state: OGMState, action: int, n: int, grid_size: int):
+    """Execute action for the current agent and advance turn.
+
+    Args:
+        state:     current OGMState
+        action:    integer in [0, 48].  48 = no-op.
+        n:         number of modules (static)
+        grid_size: half-width of validation grid (static)
+
+    Returns:
+        (new_state, reward, terminated, truncated)
+    """
+    positions = state.module_positions
+    agent = state.agent_idx
+
+    # --- apply action ---
+    deltas = get_action_deltas()  # (48, 3)
+    # If action < 48 use the delta; otherwise (no-op) delta is 0
+    delta = jnp.where(
+        action < 48, deltas[jnp.clip(action, 0, 47)], jnp.zeros(3, dtype=jnp.int32)
+    )
+    new_positions = positions.at[agent].add(delta)
+
+    # --- reward ---
+    reward = compute_reward(positions, new_positions, state.final_positions)
+
+    # --- termination ---
+    terminated = check_success(new_positions, state.final_positions)
+    truncated = (state.step_count + 1) >= state.max_steps
+
+    # --- advance turn ---
+    next_agent = (agent + 1) % n
+
+    new_state = OGMState(
+        module_positions=new_positions,
+        final_positions=state.final_positions,
+        step_count=state.step_count + 1,
+        max_steps=state.max_steps,
+        agent_idx=next_agent,
+    )
+
+    return new_state, reward, terminated, truncated
+
+
+# ============================================
+# Vectorized environment wrapper
+# ============================================
+
 
 class VectorizedOGMEnv:
+    """Wraps config into an object with reset / step / get_action_mask.
+
+    All methods are JIT-compiled and can be vmap-ed over a batch of keys /
+    states for TPU-parallel rollout collection.
     """
-    Vectorized environment for running many instances in parallel.
-    
-    Compatible with PureJaxRL-style training.
-    """
-    
+
     def __init__(self, config: OGMConfig):
         self.config = config
-        self.obs_shape = (config.local_k * 4 + 4,)  # Four-band + agent encoding
-        self.action_space = NUM_ACTIONS
-        
+        self.n = config.n
+        self.grid_size = config.grid_size
+        self.local_k = config.local_k
+        self.obs_dim = config.local_k * 4 + 4
+        self.obs_shape = (self.obs_dim,)
+        self.action_dim = NUM_ACTIONS
+
+    # ---------- reset ----------
     @partial(jax.jit, static_argnums=(0,))
     def reset(self, key: chex.PRNGKey) -> Tuple[chex.Array, OGMState]:
-        """Reset environment and return initial observation."""
         state = reset(key, self.config)
-        obs = get_observation(state, 0, True, self.config.local_k)
+        obs = get_observation(
+            state.module_positions, state.final_positions, state.agent_idx, self.local_k
+        )
         return obs, state
-    
+
+    # ---------- step ----------
     @partial(jax.jit, static_argnums=(0,))
     def step(
-        self,
-        state: OGMState,
-        action: int,
-        agent_idx: int
-    ) -> Tuple[chex.Array, OGMState, float, bool, dict]:
-        """Execute step and return (obs, state, reward, done, info)."""
-        state, reward, done, truncated, info = step(state, action, agent_idx)
-        
-        # Next agent
-        next_agent = (agent_idx + 1) % state.n
-        obs = get_observation(state, next_agent, True, self.config.local_k)
-        
-        return obs, state, reward, done | truncated, info
-    
+        self, state: OGMState, action: int
+    ) -> Tuple[chex.Array, OGMState, float, bool]:
+        """Take one step.  Returns (obs, new_state, reward, done)."""
+        new_state, reward, terminated, truncated = step_with_action(
+            state, action, self.n, self.grid_size
+        )
+        done = terminated | truncated
+
+        obs = get_observation(
+            new_state.module_positions,
+            new_state.final_positions,
+            new_state.agent_idx,
+            self.local_k,
+        )
+        return obs, new_state, reward, done
+
+    # ---------- action mask ----------
     @partial(jax.jit, static_argnums=(0,))
-    def get_action_mask(self, state: OGMState, agent_idx: int) -> chex.Array:
-        """Get valid action mask for agent."""
-        return get_action_mask(state, agent_idx)
+    def get_action_mask(self, state: OGMState) -> chex.Array:
+        """(49,) bool mask for the current agent."""
+        # Rotate positions so the acting agent is index 0
+        agent = state.agent_idx
+        n = self.n
+        # Roll the position array so that agent becomes index 0
+        rolled = jnp.roll(state.module_positions, -agent, axis=0)
+        return get_action_mask(rolled, n, self.grid_size)

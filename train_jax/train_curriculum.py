@@ -1,8 +1,24 @@
 """
-Curriculum Training Script for JAX/TPU.
+Curriculum training script for JAX / TPU.
 
-Implements curriculum learning for scaling to n=50 agents
-using JAX-accelerated training on TPU.
+Trains the MSSA pivoting-cube agent from n=4 up to n=50 using
+curriculum learning.  Each stage:
+  1. Creates a VectorizedOGMEnv for the current n.
+  2. Initialises (or loads) an ActorCritic network.
+  3. Runs vectorised rollout collection across n_envs parallel
+     environments using vmap over the single-env rollout fn.
+  4. Concatenates all transitions and runs a batched PPO update.
+  5. Tracks a rolling success rate (last ROLLING_WINDOW episodes).
+  6. Advances to the next stage once the rolling success rate
+     exceeds the stage target (or max_episodes is reached).
+
+Usage:
+    python train_jax/train_curriculum.py --target_n 50 --n_envs 256
+
+    # Resume from checkpoint
+    python train_jax/train_curriculum.py --target_n 50 \
+        --load_checkpoint runs/jax_curriculum/stage_n8/checkpoint.pkl \
+        --start_stage 4
 """
 
 import jax
@@ -13,35 +29,31 @@ from functools import partial
 from typing import Dict, List, Optional, Tuple
 import time
 import os
+import sys
 import argparse
 from datetime import datetime
 import pickle
 
-# Local imports
-import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from jax_env.ogm_jax import OGMConfig, VectorizedOGMEnv, NUM_ACTIONS
+from jax_env.ogm_jax import OGMConfig, VectorizedOGMEnv, NUM_ACTIONS, check_success
 from train_jax.ppo_jax import (
     ActorCritic,
     PPOConfig,
+    Transition,
+    Categorical,
     create_train_state,
     make_ppo_update,
     make_rollout_fn,
-    Transition,
-    Categorical,
 )
 
 
 # ============================================
-# Curriculum Configuration
+# Curriculum stage definitions
 # ============================================
 
-# Rolling success window size for computing success rate
 ROLLING_WINDOW_SIZE = 100
-
-# Default threshold for advancing to next stage (rolling success rate)
-DEFAULT_ADVANCE_THRESHOLD = 0.85  # 85% rolling success rate
+DEFAULT_ADVANCE_THRESHOLD = 0.85
 
 CURRICULUM_STAGES: List[Dict] = [
     {
@@ -49,7 +61,7 @@ CURRICULUM_STAGES: List[Dict] = [
         "max_steps": 600,
         "min_episodes": 500,
         "max_episodes": 2000,
-        "target_rolling_success": 0.85,  # Move on when rolling success >= 85%
+        "target_rolling_success": 0.85,
         "lr": 5e-4,
         "entropy": 0.03,
     },
@@ -147,15 +159,15 @@ CURRICULUM_STAGES: List[Dict] = [
 
 
 # ============================================
-# Training Functions
+# Helpers
 # ============================================
 
+
 def make_env(stage: Dict, local_k: int = 7) -> VectorizedOGMEnv:
-    """Create environment for a curriculum stage."""
     config = OGMConfig(
         n=stage["n"],
         max_steps=stage["max_steps"],
-        grid_size=50,
+        grid_size=max(5, stage["n"] * 2 + 3),  # match NumPy calculate_grid_size
         use_unlabeled=True,
         local_k=local_k,
     )
@@ -163,7 +175,6 @@ def make_env(stage: Dict, local_k: int = 7) -> VectorizedOGMEnv:
 
 
 def make_ppo_config(stage: Dict) -> PPOConfig:
-    """Create PPO config for a curriculum stage."""
     return PPOConfig(
         learning_rate=stage["lr"],
         gamma=0.99,
@@ -175,29 +186,92 @@ def make_ppo_config(stage: Dict) -> PPOConfig:
         n_steps=256,
         n_minibatches=8,
         n_epochs=4,
-        anneal_lr=False,  # We handle LR in curriculum
+        anneal_lr=False,
     )
 
 
-@partial(jax.jit, static_argnums=(0, 1))
-def vectorized_reset(
-    env: VectorizedOGMEnv,
-    n_envs: int,
-    keys: jax.Array
-) -> Tuple[jax.Array, any]:
-    """Reset multiple environments in parallel."""
-    return jax.vmap(env.reset)(keys)
+# ============================================
+# Vectorised rollout + reset (the core TPU
+# workload -- everything here is vmap-ed)
+# ============================================
 
 
-@partial(jax.jit, static_argnums=(0,))
-def vectorized_step(
-    env: VectorizedOGMEnv,
-    states,
-    actions: jax.Array,
-    agent_indices: jax.Array
-) -> Tuple[jax.Array, any, jax.Array, jax.Array, dict]:
-    """Step multiple environments in parallel."""
-    return jax.vmap(env.step)(states, actions, agent_indices)
+def _make_vectorised_step(env: VectorizedOGMEnv, network: ActorCritic):
+    """Return a JIT-compiled function that does ONE step across n_envs."""
+
+    @jax.jit
+    def vec_step(train_state, env_states, obs_batch, key):
+        """Single environment-step for all envs in parallel.
+
+        Returns:
+            (env_states, obs_batch, key,
+             transitions,          # Transition with leading (n_envs,)
+             dones, successes)     # (n_envs,) bool arrays
+        """
+        n_envs = obs_batch.shape[0]
+        key, action_key = jax.random.split(key)
+
+        # --- action masks for all envs (vmap over env) ---
+        action_masks = jax.vmap(env.get_action_mask)(env_states)  # (n_envs, 49)
+
+        # --- forward pass (batched) ---
+        logits, values = network.apply(train_state.params, obs_batch, action_masks)
+        # logits: (n_envs, 49), values: (n_envs,)
+
+        # --- sample actions ---
+        action_keys = jax.random.split(action_key, n_envs)
+        pi = Categorical(logits)  # batched
+        actions = jax.vmap(lambda lg, k: jax.random.categorical(k, lg))(
+            logits, action_keys
+        )
+        log_probs = pi.log_prob(actions)  # (n_envs,)
+
+        # --- step all envs ---
+        next_obs, next_states, rewards, dones = jax.vmap(env.step)(
+            env_states, actions
+        )  # all (n_envs, ...)
+
+        # --- detect successes BEFORE auto-reset ---
+        # success = done AND not truncated.  We approximate: if done and
+        # the potential is ~0 we call it a success.  A simpler proxy:
+        # check_success on the NEW positions (before reset overwrites them).
+        successes = jax.vmap(check_success)(
+            next_states.module_positions,
+            next_states.final_positions,
+        )  # (n_envs,) bool
+
+        # --- auto-reset done environments ---
+        all_keys = jax.random.split(key, n_envs + 1)  # (n_envs+1, 2)
+        key = all_keys[0]
+        reset_keys = all_keys[1:]  # (n_envs, 2)
+        reset_obs, reset_states = jax.vmap(env.reset)(reset_keys)  # (n_envs, ...)
+
+        # where done, swap in the reset state/obs
+        next_obs = jnp.where(dones[:, None], reset_obs, next_obs)
+        next_states = jax.tree.map(
+            lambda r, n: jnp.where(dones.reshape((-1,) + (1,) * (r.ndim - 1)), r, n),
+            reset_states,
+            next_states,
+        )
+
+        t = Transition(
+            obs=obs_batch,
+            action=actions,
+            reward=rewards,
+            done=dones,
+            value=values,
+            log_prob=log_probs,
+            action_mask=action_masks,
+        )
+
+        return next_states, next_obs, key, t, dones, successes
+
+    return vec_step
+
+
+# ============================================
+# Single-stage training loop
+# ============================================
 
 
 def train_stage(
@@ -206,309 +280,235 @@ def train_stage(
     prev_params: Optional[dict] = None,
     log_dir: str = "runs/jax_curriculum",
     local_k: int = 7,
-    n_envs: int = 256,  # Many parallel envs on TPU
-    key: jax.Array = None,
+    n_envs: int = 256,
+    key: Optional[jax.Array] = None,
     verbose: bool = True,
-    rolling_window_size: int = ROLLING_WINDOW_SIZE,
+    rolling_window: int = ROLLING_WINDOW_SIZE,
 ) -> Tuple[dict, float]:
-    """
-    Train a single curriculum stage.
-    
-    Args:
-        stage: Stage configuration
-        stage_idx: Index of this stage
-        prev_params: Parameters from previous stage (for fine-tuning)
-        log_dir: Directory for logs and checkpoints
-        local_k: Local neighborhood size
-        n_envs: Number of parallel environments
-        key: Random key
-        verbose: Whether to print progress
-        rolling_window_size: Window size for computing rolling success rate
-        
-    Returns:
-        Tuple of (trained_params, final_rolling_success_rate)
-    """
+    """Train one curriculum stage.  Returns (final_params, rolling_success)."""
+
     if key is None:
         key = jax.random.PRNGKey(42)
-    
+
     n = stage["n"]
-    
-    # Create environment and network
+
+    # --- setup ---
     env = make_env(stage, local_k)
     network = ActorCritic(action_dim=NUM_ACTIONS, hidden_dims=(512, 512, 256))
     ppo_config = make_ppo_config(stage)
-    
-    # Create stage log directory
+
     stage_dir = os.path.join(log_dir, f"stage_n{n}")
     os.makedirs(stage_dir, exist_ok=True)
-    
-    # Get target rolling success rate (default to 85%)
+
     target_rolling = stage.get("target_rolling_success", DEFAULT_ADVANCE_THRESHOLD)
-    
+
     if verbose:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"  Stage {stage_idx + 1}: n={n}")
-        print(f"  🎯 Target rolling success (last {rolling_window_size}): {target_rolling*100:.0f}%")
-        print(f"  LR: {stage['lr']:.2e}, Entropy: {stage['entropy']:.3f}")
-        print(f"  Max steps: {stage['max_steps']}, Episodes: {stage['max_episodes']}")
-        print(f"  Parallel environments: {n_envs}")
-        print(f"{'='*60}")
-    
-    # Initialize training state
+        print(
+            f"  Target rolling success (window={rolling_window}): {target_rolling * 100:.0f}%"
+        )
+        print(f"  LR={stage['lr']:.2e}  ent={stage['entropy']}")
+        print(f"  max_steps={stage['max_steps']}  max_episodes={stage['max_episodes']}")
+        print(f"  Parallel envs: {n_envs}")
+        print(f"  JAX devices: {jax.devices()}")
+        print(f"{'=' * 60}")
+
+    # --- initialise network ---
     key, init_key = jax.random.split(key)
     train_state = create_train_state(init_key, network, ppo_config, env.obs_shape)
-    
-    # Load previous parameters if available
+
     if prev_params is not None:
         if verbose:
-            print("Loading parameters from previous stage...")
+            print("  Loading params from previous stage...")
         train_state = train_state.replace(params=prev_params)
-    
-    # Initialize environments
-    key, *env_keys = jax.random.split(key, n_envs + 1)
-    env_keys = jnp.stack(env_keys)
-    obs_batch, env_states = vectorized_reset(env, n_envs, env_keys)
-    agent_indices = jnp.zeros(n_envs, dtype=jnp.int32)
-    
-    # Create update functions
+
+    # --- initialise environments ---
+    all_init_keys = jax.random.split(key, n_envs + 1)  # (n_envs+1, 2)
+    key = all_init_keys[0]
+    env_keys = all_init_keys[1:]  # (n_envs, 2)
+    obs_batch, env_states = jax.vmap(env.reset)(env_keys)  # (n_envs, obs_dim), states
+
+    # --- compile step & update fns ---
+    vec_step = _make_vectorised_step(env, network)
     ppo_update = make_ppo_update(network, ppo_config)
-    
-    # Tracking
+
+    # --- tracking ---
+    episode_outcomes = []  # list of 0/1 for rolling window
     episode_count = 0
-    success_count = 0
-    recent_successes = []  # List of 1s (success) and 0s (failure) for last N episodes
     start_time = time.time()
-    best_rolling_success = 0.0
-    
-    # Main training loop
+    best_rolling = 0.0
+
     steps_per_update = ppo_config.n_steps * n_envs
-    total_steps = stage["max_episodes"] * stage["max_steps"]
-    n_updates = total_steps // steps_per_update
-    
-    for update in range(n_updates):
-        key, rollout_key, update_key = jax.random.split(key, 3)
-        
-        # Collect rollouts from all environments
-        # This is where the TPU parallelism shines
+    total_budget = stage["max_episodes"] * stage["max_steps"]
+    n_updates = total_budget // steps_per_update
+
+    # --- main loop ---
+    for update_idx in range(n_updates):
+        # ---- collect n_steps of experience ----
         transitions_list = []
-        
-        for step in range(ppo_config.n_steps):
-            key, action_key = jax.random.split(key)
-            
-            # Get action masks for all envs
-            action_masks = jax.vmap(env.get_action_mask)(env_states, agent_indices)
-            
-            # Forward pass for all envs
-            logits, values = jax.vmap(
-                lambda o, m: network.apply(train_state.params, o[None], m[None])
-            )(obs_batch, action_masks)
-            
-            # Need to squeeze the batch dim added above
-            # Shape of logits: (n_envs, 1, 49) -> (n_envs, 49)
-            logits = logits[:, 0]
-            values = values[:, 0]
-            
-            # Create distribution
-            pis = Categorical(logits)
-            
-            # Sample actions
-            action_keys = jax.random.split(action_key, n_envs)
-            actions = jax.vmap(lambda pi, k: pi.sample(seed=k))(pis, action_keys)
-            log_probs = jax.vmap(lambda pi, a: pi.log_prob(a))(pis, actions)
-            
-            # Step all environments
-            next_obs, env_states, rewards, dones, infos = vectorized_step(
-                env, env_states, actions, agent_indices
+
+        for _ in range(ppo_config.n_steps):
+            env_states, obs_batch, key, t, dones, successes = vec_step(
+                train_state, env_states, obs_batch, key
             )
-            
-            # Store transition
-            transitions_list.append(Transition(
-                obs=obs_batch,
-                action=actions,
-                reward=rewards,
-                done=dones,
-                value=values,
-                log_prob=log_probs,
-                action_mask=action_masks,
-            ))
-            
-            # Update agent indices
-            agent_indices = (agent_indices + 1) % n
-            obs_batch = next_obs
-            
-            # Track episodes
-            n_done = jnp.sum(dones).item()
-            n_success = jnp.sum(jnp.array([info.get("success", False) for info in infos])).item() if isinstance(infos, list) else dones.sum().item()  # Simplified
-            episode_count += n_done
-            success_count += n_success
-            
-            # Track individual episode outcomes for rolling success
-            done_indices = jnp.where(dones)[0]
-            for idx in done_indices:
-                # For now, simplified: check if this was a success
-                # In a full implementation, we'd track per-env success
-                is_success = n_success > 0 and len(done_indices) > 0
-                recent_successes.append(1 if is_success else 0)
-                if len(recent_successes) > rolling_window_size:
-                    recent_successes.pop(0)
-            
-            # Reset done environments
-            done_mask = dones
-            if jnp.any(done_mask):
-                key, *reset_keys = jax.random.split(key, int(done_mask.sum()) + 1)
-                reset_keys = jnp.stack(reset_keys)
-                # TODO: Selective reset for done envs
-        
-        # Stack transitions
-        transitions = jax.tree_map(lambda *xs: jnp.stack(xs), *transitions_list)
-        
-        # Reshape for PPO update: (n_steps, n_envs, ...) -> (n_steps * n_envs, ...)
-        transitions = jax.tree_map(
+
+            transitions_list.append(t)
+
+            # track episodes that finished this step
+            done_np = dones.tolist()  # materialise to host
+            success_np = successes.tolist()
+            for i in range(n_envs):
+                if done_np[i]:
+                    episode_count += 1
+                    episode_outcomes.append(1 if success_np[i] else 0)
+                    # keep only the last `rolling_window` outcomes
+                    if len(episode_outcomes) > rolling_window:
+                        episode_outcomes.pop(0)
+
+        # ---- stack & flatten transitions ----
+        # Each element of transitions_list is a Transition with leading (n_envs,)
+        # Stack -> (n_steps, n_envs, ...) then reshape -> (n_steps*n_envs, ...)
+        transitions = jax.tree.map(
+            lambda *xs: jnp.stack(xs, axis=0), *transitions_list
+        )  # (n_steps, n_envs, ...)
+        transitions = jax.tree.map(
             lambda x: x.reshape(-1, *x.shape[2:]) if x.ndim > 2 else x.reshape(-1),
-            transitions
-        )
-        
-        # Get bootstrap value
-        action_masks = jax.vmap(env.get_action_mask)(env_states, agent_indices)
-        _, next_values = jax.vmap(
-            lambda o, m: network.apply(train_state.params, o[None], m[None])
-        )(obs_batch, action_masks)
-        next_value = next_values[:, 0].mean()  # Average across envs
-        
-        # PPO update
+            transitions,
+        )  # (n_steps*n_envs, ...)
+
+        # ---- bootstrap value ----
+        action_masks = jax.vmap(env.get_action_mask)(env_states)  # (n_envs, 49)
+        _, next_values = network.apply(
+            train_state.params, obs_batch, action_masks
+        )  # (n_envs,)
+        next_value = next_values.mean()  # scalar
+
+        # ---- PPO update ----
+        key, update_key = jax.random.split(key)
         train_state, metrics = ppo_update(
             train_state, transitions, next_value, update_key
         )
-        
-        # Logging
-        if update % 10 == 0:
-            rolling_success = sum(recent_successes) / max(len(recent_successes), 1)
-            overall_success = success_count / max(episode_count, 1)
+
+        # ---- logging ----
+        if update_idx % 10 == 0:
+            rolling_success = sum(episode_outcomes) / max(len(episode_outcomes), 1)
+            if len(episode_outcomes) >= rolling_window:
+                best_rolling = max(best_rolling, rolling_success)
+
             elapsed = time.time() - start_time
-            steps_done = (update + 1) * steps_per_update
-            
-            # Track best rolling success
-            if len(recent_successes) >= rolling_window_size:
-                best_rolling_success = max(best_rolling_success, rolling_success)
-            
+
             if verbose:
-                # Prominently display rolling success rate
-                window_info = f"({len(recent_successes)}/{rolling_window_size})"
-                progress_bar = "▓" * int(rolling_success * 20) + "░" * (20 - int(rolling_success * 20))
-                print(f"Update {update:4d} | Ep: {episode_count:5d} | "
-                      f"Rolling{window_info}: [{progress_bar}] {rolling_success*100:5.1f}% | "
-                      f"Overall: {overall_success*100:4.1f}% | "
-                      f"Loss: {metrics['total_loss']:.4f}")
-            
-            # Check early stopping based on ROLLING success rate
-            if (episode_count >= stage["min_episodes"] and 
-                len(recent_successes) >= rolling_window_size and
-                rolling_success >= target_rolling):
+                bar_len = 20
+                filled = int(rolling_success * bar_len)
+                bar = "X" * filled + "-" * (bar_len - filled)
+                winfo = f"{len(episode_outcomes)}/{rolling_window}"
+                print(
+                    f"  upd {update_idx:5d} | ep {episode_count:6d} | "
+                    f"roll[{winfo}]=[{bar}] {rolling_success * 100:5.1f}% | "
+                    f"loss={float(metrics['total_loss']):7.4f} | "
+                    f"{elapsed / 60:.1f}m"
+                )
+
+            # ---- early stop on target ----
+            if (
+                episode_count >= stage["min_episodes"]
+                and len(episode_outcomes) >= rolling_window
+                and rolling_success >= target_rolling
+            ):
                 if verbose:
-                    print(f"\n🎯 TARGET REACHED! Rolling success rate (last {rolling_window_size}): {rolling_success*100:.1f}% >= {target_rolling*100:.0f}%")
-                    print(f"   Overall success rate: {overall_success*100:.1f}%")
+                    print(
+                        f"\n  TARGET HIT: rolling {rolling_success * 100:.1f}% >= {target_rolling * 100:.0f}%"
+                    )
                 break
-        
-        # Check max episodes
+
+        # ---- max episodes ----
         if episode_count >= stage["max_episodes"]:
             if verbose:
-                print(f"\nMax episodes reached ({stage['max_episodes']})")
+                print(f"\n  Max episodes reached ({stage['max_episodes']})")
             break
-    
-    # Final statistics
-    final_rolling_success = sum(recent_successes) / max(len(recent_successes), 1)
-    overall_success = success_count / max(episode_count, 1)
+
+    # --- final stats ---
+    final_rolling = sum(episode_outcomes) / max(len(episode_outcomes), 1)
     elapsed = time.time() - start_time
-    
+
     if verbose:
-        print(f"\n{'='*60}")
-        print(f"  Stage {stage_idx + 1} (n={n}) Complete!")
-        print(f"{'='*60}")
+        print(f"\n{'=' * 60}")
+        print(f"  Stage {stage_idx + 1} (n={n}) done")
         print(f"  Episodes: {episode_count}")
-        print(f"  📊 Final Rolling Success (last {rolling_window_size}): {final_rolling_success*100:.1f}%")
-        print(f"  📊 Best Rolling Success: {best_rolling_success*100:.1f}%")
-        print(f"  📊 Overall Success Rate: {overall_success*100:.1f}%")
-        print(f"  🎯 Target was: {target_rolling*100:.0f}%")
-        print(f"  ⏱️  Time: {elapsed/60:.1f} minutes")
-    
-    # Save checkpoint with rolling success info
-    checkpoint_path = os.path.join(stage_dir, "checkpoint.pkl")
-    with open(checkpoint_path, "wb") as f:
-        pickle.dump({
-            "params": train_state.params,
-            "stage": stage,
-            "rolling_success_rate": final_rolling_success,
-            "best_rolling_success": best_rolling_success,
-            "overall_success_rate": overall_success,
-            "episodes": episode_count,
-            "rolling_window_size": rolling_window_size,
-        }, f)
-    
+        print(f"  Rolling success (last {rolling_window}): {final_rolling * 100:.1f}%")
+        print(f"  Best rolling success: {best_rolling * 100:.1f}%")
+        print(f"  Target was: {target_rolling * 100:.0f}%")
+        print(f"  Time: {elapsed / 60:.1f} min")
+
+    # --- checkpoint ---
+    ckpt_path = os.path.join(stage_dir, "checkpoint.pkl")
+    with open(ckpt_path, "wb") as f:
+        pickle.dump(
+            {
+                "params": train_state.params,
+                "stage": stage,
+                "rolling_success_rate": final_rolling,
+                "best_rolling_success": best_rolling,
+                "episodes": episode_count,
+                "rolling_window_size": rolling_window,
+            },
+            f,
+        )
     if verbose:
-        print(f"  💾 Checkpoint saved: {checkpoint_path}")
-    
-    return train_state.params, final_rolling_success
+        print(f"  Checkpoint: {ckpt_path}")
+        print(f"{'=' * 60}")
+
+    return train_state.params, final_rolling
+
+
+# ============================================
+# Full curriculum
+# ============================================
 
 
 def run_curriculum(
     start_stage: int = 0,
     target_n: int = 50,
-    log_dir: str = None,
+    log_dir: Optional[str] = None,
     local_k: int = 7,
     n_envs: int = 256,
-    load_checkpoint: str = None,
+    load_checkpoint: Optional[str] = None,
     verbose: bool = True,
 ):
-    """
-    Run full curriculum learning.
-    
-    Args:
-        start_stage: Stage to start from (0-indexed)
-        target_n: Target number of agents
-        log_dir: Logging directory
-        local_k: Local neighborhood size
-        n_envs: Number of parallel environments
-        load_checkpoint: Path to checkpoint to load
-        verbose: Whether to print progress
-    """
     if log_dir is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_dir = f"runs/jax_curriculum/to_n{target_n}_{timestamp}"
-    
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_dir = f"runs/jax_curriculum/to_n{target_n}_{ts}"
     os.makedirs(log_dir, exist_ok=True)
-    
-    # Filter stages up to target
+
     stages = [s for s in CURRICULUM_STAGES if s["n"] <= target_n]
-    
+
     if verbose:
-        print(f"\n{'='*60}")
-        print(f"  MSSA Curriculum Learning (JAX/TPU)")
-        print(f"  Target: n={target_n}")
-        print(f"  Stages: {len(stages)}")
-        print(f"  Start stage: {start_stage + 1}")
-        print(f"  Log directory: {log_dir}")
-        print(f"  Parallel environments: {n_envs}")
-        print(f"{'='*60}")
-        
-        # Print device info
-        print(f"\nJAX devices: {jax.devices()}")
-        print(f"TPU available: {any('TPU' in str(d) for d in jax.devices())}\n")
-    
-    # Load checkpoint if provided
+        print(f"\n{'=' * 60}")
+        print(f"  MSSA JAX Curriculum  ->  n={target_n}")
+        print(f"  Stages: {[s['n'] for s in stages]}")
+        print(f"  Start:  stage {start_stage + 1}")
+        print(f"  Envs:   {n_envs}")
+        print(f"  Log:    {log_dir}")
+        print(f"  JAX devices: {jax.devices()}")
+        tpu = any("tpu" in str(d).lower() for d in jax.devices())
+        print(f"  TPU detected: {tpu}")
+        print(f"{'=' * 60}\n")
+
+    # --- optional checkpoint load ---
     prev_params = None
-    if load_checkpoint:
+    if load_checkpoint and os.path.exists(load_checkpoint):
         with open(load_checkpoint, "rb") as f:
-            checkpoint = pickle.load(f)
-        prev_params = checkpoint["params"]
+            ckpt = pickle.load(f)
+        prev_params = ckpt["params"]
         if verbose:
-            print(f"Loaded checkpoint from {load_checkpoint}")
-    
-    # Run stages
+            print(f"  Loaded checkpoint: {load_checkpoint}")
+
     key = jax.random.PRNGKey(42)
-    
+
     for i, stage in enumerate(stages[start_stage:], start=start_stage):
         key, stage_key = jax.random.split(key)
-        
+
         params, success_rate = train_stage(
             stage=stage,
             stage_idx=i,
@@ -519,21 +519,24 @@ def run_curriculum(
             key=stage_key,
             verbose=verbose,
         )
-        
+
         prev_params = params
-        
-        # Check if stage failed to reach rolling success target
-        target_rolling = stage.get("target_rolling_success", DEFAULT_ADVANCE_THRESHOLD)
-        if success_rate < target_rolling * 0.8:  # Allow 20% tolerance
+
+        # warn if far below target
+        target = stage.get("target_rolling_success", DEFAULT_ADVANCE_THRESHOLD)
+        if success_rate < target * 0.8:
             if verbose:
-                print(f"\n⚠️  Stage {i+1} rolling success {success_rate*100:.1f}% < target {target_rolling*100:.0f}%")
-                print(f"    Consider adjusting hyperparameters or training longer.")
-    
+                print(
+                    f"\n  WARNING: stage {i + 1} success {success_rate * 100:.1f}% "
+                    f"< 80% of target {target * 100:.0f}%. "
+                    f"Consider tuning hyperparameters or training longer."
+                )
+
     if verbose:
-        print(f"\n{'='*60}")
-        print("  Curriculum training complete!")
-        print(f"{'='*60}")
-    
+        print(f"\n{'=' * 60}")
+        print(f"  Curriculum complete!")
+        print(f"{'=' * 60}")
+
     return prev_params
 
 
@@ -541,18 +544,19 @@ def run_curriculum(
 # CLI
 # ============================================
 
+
 def main():
     parser = argparse.ArgumentParser(description="JAX Curriculum Training for MSSA")
-    parser.add_argument("--start_stage", type=int, default=0, help="Stage to start from (0-indexed)")
-    parser.add_argument("--target_n", type=int, default=50, help="Target number of agents")
-    parser.add_argument("--log_dir", type=str, default=None, help="Logging directory")
-    parser.add_argument("--local_k", type=int, default=7, help="Local neighborhood size")
-    parser.add_argument("--n_envs", type=int, default=256, help="Number of parallel environments")
-    parser.add_argument("--load_checkpoint", type=str, default=None, help="Checkpoint to load")
-    parser.add_argument("--quiet", action="store_true", help="Suppress output")
-    
+    parser.add_argument("--start_stage", type=int, default=0)
+    parser.add_argument("--target_n", type=int, default=50)
+    parser.add_argument("--log_dir", type=str, default=None)
+    parser.add_argument("--local_k", type=int, default=7)
+    parser.add_argument("--n_envs", type=int, default=256)
+    parser.add_argument("--load_checkpoint", type=str, default=None)
+    parser.add_argument("--quiet", action="store_true")
+
     args = parser.parse_args()
-    
+
     run_curriculum(
         start_stage=args.start_stage,
         target_n=args.target_n,
