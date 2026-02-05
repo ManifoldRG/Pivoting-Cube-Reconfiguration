@@ -721,6 +721,11 @@ class OGMState(NamedTuple):
     max_steps: int  # episode length limit (scalar int32)
     # agent_idx tracks whose turn it is (round-robin)
     agent_idx: int  # scalar int32
+    # Milestone tracking for partial progress rewards (matches PyTorch baseline)
+    initial_norm_diff: float  # frobenius norm of initial config distance
+    milestone_50: bool  # whether 50% progress bonus was awarded
+    milestone_75: bool  # whether 75% progress bonus was awarded
+    milestone_90: bool  # whether 90% progress bonus was awarded
 
 
 class OGMConfig(NamedTuple):
@@ -965,19 +970,101 @@ def compute_reward(
     prev_positions: chex.Array,
     curr_positions: chex.Array,
     final_positions: chex.Array,
+    initial_norm_diff: float,
+    milestone_50: bool,
+    milestone_75: bool,
+    milestone_90: bool,
     step_cost: float = -0.005,
     potential_scale: float = 1.0,
     success_bonus: float = 100.0,
-) -> float:
-    """Shaped reward: step_cost + potential shaping + success bonus."""
+) -> tuple[float, bool, bool, bool]:
+    """Shaped reward: step_cost + potential shaping + success bonus + milestone bonuses.
+
+    Potential is normalized by n to keep reward scale consistent across
+    curriculum stages (prevents n=8+ from having 4-100× larger shaping signal).
+
+    Milestone bonuses (matches PyTorch baseline):
+    - 50% progress: +10% of success_bonus
+    - 75% progress: +20% of success_bonus
+    - 90% progress: +30% of success_bonus
+
+    Returns:
+        (reward, new_milestone_50, new_milestone_75, new_milestone_90)
+    """
+    n = prev_positions.shape[0]
     prev_phi = compute_potential(prev_positions, final_positions)
     curr_phi = compute_potential(curr_positions, final_positions)
 
-    shaping = potential_scale * (prev_phi - curr_phi)  # positive when improving
+    # Normalize by n to keep reward scale consistent (critical for curriculum)
+    shaping = potential_scale * (prev_phi - curr_phi) / jnp.float32(n)
     done = check_success(curr_positions, final_positions)
     bonus = jnp.where(done, success_bonus, 0.0)
 
-    return step_cost + shaping + bonus
+    # Milestone bonuses for partial progress (helps with large n)
+    milestone_bonus = 0.0
+    new_m50, new_m75, new_m90 = milestone_50, milestone_75, milestone_90
+
+    # Only award milestones if not already successful
+    curr_norm_diff = jnp.linalg.norm(
+        compute_pairwise_norms(curr_positions)
+        - compute_pairwise_norms(final_positions),
+        "fro",
+    )
+    progress = jnp.where(
+        initial_norm_diff > 0,
+        1.0 - (curr_norm_diff / initial_norm_diff),
+        0.0,
+    )
+
+    # Check milestones in descending order (90% -> 75% -> 50%)
+    # Award highest applicable milestone that hasn't been reached yet
+    milestone_bonus = jnp.where(
+        ~done & (progress >= 0.9) & ~milestone_90,
+        success_bonus * 0.3,  # 30 points
+        milestone_bonus,
+    )
+    new_m90 = jnp.where(
+        ~done & (progress >= 0.9) & ~milestone_90,
+        True,
+        new_m90,
+    )
+
+    milestone_bonus = jnp.where(
+        ~done
+        & (progress >= 0.75)
+        & ~milestone_75
+        & ~(~done & (progress >= 0.9) & ~milestone_90),
+        success_bonus * 0.2,  # 20 points
+        milestone_bonus,
+    )
+    new_m75 = jnp.where(
+        ~done
+        & (progress >= 0.75)
+        & ~milestone_75
+        & ~(~done & (progress >= 0.9) & ~milestone_90),
+        True,
+        new_m75,
+    )
+
+    milestone_bonus = jnp.where(
+        ~done
+        & (progress >= 0.5)
+        & ~milestone_50
+        & ~(~done & (progress >= 0.75) & ~milestone_75),
+        success_bonus * 0.1,  # 10 points
+        milestone_bonus,
+    )
+    new_m50 = jnp.where(
+        ~done
+        & (progress >= 0.5)
+        & ~milestone_50
+        & ~(~done & (progress >= 0.75) & ~milestone_75),
+        True,
+        new_m50,
+    )
+
+    total_reward = step_cost + shaping + bonus + milestone_bonus
+    return total_reward, new_m50, new_m75, new_m90
 
 
 # ============================================
@@ -1049,12 +1136,21 @@ def reset(key: chex.PRNGKey, config: OGMConfig) -> OGMState:
     init_pos = make_connected_configuration(key1, config.n)
     final_pos = make_connected_configuration(key2, config.n)
 
+    # Calculate initial norm difference for milestone tracking
+    init_norms = compute_pairwise_norms(init_pos)
+    final_norms = compute_pairwise_norms(final_pos)
+    initial_norm_diff = jnp.linalg.norm(init_norms - final_norms, "fro")
+
     return OGMState(
         module_positions=init_pos,
         final_positions=final_pos,
         step_count=jnp.int32(0),
         max_steps=jnp.int32(config.max_steps),
         agent_idx=jnp.int32(0),
+        initial_norm_diff=initial_norm_diff,
+        milestone_50=False,
+        milestone_75=False,
+        milestone_90=False,
     )
 
 
@@ -1135,8 +1231,16 @@ def step_with_action(state: OGMState, action: int, n: int, grid_size: int):
     )
     new_positions = positions.at[agent].add(delta)
 
-    # --- reward ---
-    reward = compute_reward(positions, new_positions, state.final_positions)
+    # --- reward (with milestone bonuses) ---
+    reward, new_m50, new_m75, new_m90 = compute_reward(
+        positions,
+        new_positions,
+        state.final_positions,
+        state.initial_norm_diff,
+        state.milestone_50,
+        state.milestone_75,
+        state.milestone_90,
+    )
 
     # --- termination ---
     terminated = check_success(new_positions, state.final_positions)
@@ -1151,6 +1255,10 @@ def step_with_action(state: OGMState, action: int, n: int, grid_size: int):
         step_count=state.step_count + 1,
         max_steps=state.max_steps,
         agent_idx=next_agent,
+        initial_norm_diff=state.initial_norm_diff,
+        milestone_50=new_m50,
+        milestone_75=new_m75,
+        milestone_90=new_m90,
     )
 
     return new_state, reward, terminated, truncated

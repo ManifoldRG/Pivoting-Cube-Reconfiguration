@@ -56,104 +56,115 @@ ROLLING_WINDOW_SIZE = 100
 DEFAULT_ADVANCE_THRESHOLD = 0.85
 
 CURRICULUM_STAGES: List[Dict] = [
+    # Stage 0: n=4 (baseline)
     {
         "n": 4,
         "max_steps": 600,
         "min_episodes": 500,
         "max_episodes": 2000,
-        "target_rolling_success": 0.85,
+        "target_rolling_success": 0.90,  # PyTorch target
         "lr": 5e-4,
         "entropy": 0.03,
     },
+    # Stage 1: n=5
     {
         "n": 5,
         "max_steps": 750,
         "min_episodes": 500,
         "max_episodes": 2500,
-        "target_rolling_success": 0.85,
+        "target_rolling_success": 0.88,  # PyTorch target
         "lr": 4.5e-4,
         "entropy": 0.03,
     },
+    # Stage 2: n=6
     {
         "n": 6,
         "max_steps": 900,
         "min_episodes": 600,
         "max_episodes": 2500,
-        "target_rolling_success": 0.85,
+        "target_rolling_success": 0.85,  # PyTorch target
         "lr": 4e-4,
         "entropy": 0.03,
     },
+    # Stage 3: n=7
     {
         "n": 7,
-        "max_steps": 1200,
+        "max_steps": 1050,  # PyTorch: 150 steps/agent
         "min_episodes": 600,
         "max_episodes": 3000,
-        "target_rolling_success": 0.85,
+        "target_rolling_success": 0.80,  # PyTorch target (was 0.85)
         "lr": 3.5e-4,
         "entropy": 0.03,
     },
+    # Stage 4: n=8 (CRITICAL - match PyTorch + increase budget)
     {
         "n": 8,
-        "max_steps": 2000,
-        "min_episodes": 1500,
-        "max_episodes": 5000,
-        "target_rolling_success": 0.85,
-        "lr": 1e-4,
-        "entropy": 0.05,
+        "max_steps": 1600,  # PyTorch: 1400, increased for better convergence
+        "min_episodes": 1000,  # PyTorch: 750, increased
+        "max_episodes": 6000,  # PyTorch: 4000, increased (2× budget)
+        "target_rolling_success": 0.75,  # PyTorch target (was 0.85)
+        "lr": 3e-4,  # PyTorch LR (was 1e-4 ❌)
+        "entropy": 0.035,  # PyTorch entropy (was 0.05)
     },
+    # Stage 5: n=10
     {
         "n": 10,
-        "max_steps": 2500,
-        "min_episodes": 2000,
-        "max_episodes": 6000,
-        "target_rolling_success": 0.85,
-        "lr": 8e-5,
-        "entropy": 0.04,
-    },
-    {
-        "n": 12,
-        "max_steps": 3000,
-        "min_episodes": 2500,
-        "max_episodes": 7000,
-        "target_rolling_success": 0.85,
-        "lr": 6e-5,
+        "max_steps": 2000,  # PyTorch: 1800, increased
+        "min_episodes": 1200,  # PyTorch: 800, increased
+        "max_episodes": 6000,  # PyTorch: 4500, increased
+        "target_rolling_success": 0.75,  # Target 75% (PyTorch: 0.70)
+        "lr": 2.5e-4,  # PyTorch LR
         "entropy": 0.03,
     },
+    # Stage 6: n=12 (NEW - target ≥75%)
+    {
+        "n": 12,
+        "max_steps": 2400,  # PyTorch had continuation to n=15, adapting
+        "min_episodes": 1500,  # PyTorch: 1000, increased
+        "max_episodes": 7000,  # PyTorch: 5000, increased
+        "target_rolling_success": 0.75,  # Target 75% (PyTorch: 0.65)
+        "lr": 2e-4,  # PyTorch LR
+        "entropy": 0.025,  # PyTorch entropy
+    },
+    # Stage 7: n=15 (for future extension)
     {
         "n": 15,
-        "max_steps": 4000,
-        "min_episodes": 3000,
+        "max_steps": 3000,
+        "min_episodes": 2000,
         "max_episodes": 8000,
-        "target_rolling_success": 0.85,
-        "lr": 5e-5,
-        "entropy": 0.025,
-    },
-    {
-        "n": 20,
-        "max_steps": 5000,
-        "min_episodes": 4000,
-        "max_episodes": 10000,
-        "target_rolling_success": 0.85,
-        "lr": 4e-5,
+        "target_rolling_success": 0.70,
+        "lr": 1.5e-4,
         "entropy": 0.02,
     },
+    # Stage 8: n=20
     {
-        "n": 30,
-        "max_steps": 7500,
-        "min_episodes": 5000,
-        "max_episodes": 12000,
-        "target_rolling_success": 0.85,
-        "lr": 3e-5,
+        "n": 20,
+        "max_steps": 4000,
+        "min_episodes": 3000,
+        "max_episodes": 10000,
+        "target_rolling_success": 0.65,
+        "lr": 1e-4,
         "entropy": 0.015,
     },
+    # Stage 9: n=30
+    {
+        "n": 30,
+        "max_steps": 6000,
+        "min_episodes": 4000,
+        "max_episodes": 12000,
+        "target_rolling_success": 0.60,
+        "lr": 8e-5,
+        "entropy": 0.01,
+    },
+    # Stage 10: n=50 (final goal)
     {
         "n": 50,
-        "max_steps": 12000,
-        "min_episodes": 6000,
+        "max_steps": 10000,
+        "min_episodes": 5000,
         "max_episodes": 15000,
-        "target_rolling_success": 0.85,
-        "lr": 2e-5,
-        "entropy": 0.01,
+        "target_rolling_success": 0.50,
+        "lr": 5e-5,
+        "entropy": 0.008,
     },
 ]
 
@@ -163,7 +174,19 @@ CURRICULUM_STAGES: List[Dict] = [
 # ============================================
 
 
-def make_env(stage: Dict, local_k: int = 7) -> VectorizedOGMEnv:
+def make_env(stage: Dict, local_k: Optional[int] = None) -> VectorizedOGMEnv:
+    """Create OGM environment for the given curriculum stage.
+
+    Args:
+        stage: dict with 'n', 'max_steps', etc.
+        local_k: number of rows in observation window. If None, defaults to stage['n']
+                 (full visibility of all modules). Original default was 7.
+    """
+    if local_k is None:
+        local_k = stage["n"]
+
+    assert isinstance(local_k, int), "local_k must be int after None check"
+
     config = OGMConfig(
         n=stage["n"],
         max_steps=stage["max_steps"],
@@ -279,7 +302,7 @@ def train_stage(
     stage_idx: int,
     prev_params: Optional[dict] = None,
     log_dir: str = "runs/jax_curriculum",
-    local_k: int = 7,
+    local_k: Optional[int] = None,  # None = use stage["n"] (full visibility)
     n_envs: int = 256,
     key: Optional[jax.Array] = None,
     verbose: bool = True,
@@ -294,7 +317,7 @@ def train_stage(
 
     # --- setup ---
     env = make_env(stage, local_k)
-    network = ActorCritic(action_dim=NUM_ACTIONS, hidden_dims=(512, 512, 256))
+    network = ActorCritic(action_dim=NUM_ACTIONS, hidden_dims=(1024, 1024, 512))
     ppo_config = make_ppo_config(stage)
 
     stage_dir = os.path.join(log_dir, f"stage_n{n}")
@@ -303,16 +326,20 @@ def train_stage(
     target_rolling = stage.get("target_rolling_success", DEFAULT_ADVANCE_THRESHOLD)
 
     if verbose:
-        print(f"\n{'=' * 60}")
-        print(f"  Stage {stage_idx + 1}: n={n}")
+        print(f"\n{'=' * 60}", flush=True)
+        print(f"  Stage {stage_idx + 1}: n={n}", flush=True)
         print(
-            f"  Target rolling success (window={rolling_window}): {target_rolling * 100:.0f}%"
+            f"  Target rolling success (window={rolling_window}): {target_rolling * 100:.0f}%",
+            flush=True,
         )
-        print(f"  LR={stage['lr']:.2e}  ent={stage['entropy']}")
-        print(f"  max_steps={stage['max_steps']}  max_episodes={stage['max_episodes']}")
-        print(f"  Parallel envs: {n_envs}")
-        print(f"  JAX devices: {jax.devices()}")
-        print(f"{'=' * 60}")
+        print(f"  LR={stage['lr']:.2e}  ent={stage['entropy']}", flush=True)
+        print(
+            f"  max_steps={stage['max_steps']}  max_episodes={stage['max_episodes']}",
+            flush=True,
+        )
+        print(f"  Parallel envs: {n_envs}", flush=True)
+        print(f"  JAX devices: {jax.devices()}", flush=True)
+        print(f"{'=' * 60}", flush=True)
 
     # --- initialise network ---
     key, init_key = jax.random.split(key)
@@ -320,7 +347,7 @@ def train_stage(
 
     if prev_params is not None:
         if verbose:
-            print("  Loading params from previous stage...")
+            print("  Loading params from previous stage...", flush=True)
         train_state = train_state.replace(params=prev_params)
 
     # --- initialise environments ---
@@ -334,8 +361,10 @@ def train_stage(
     ppo_update = make_ppo_update(network, ppo_config)
 
     # --- tracking ---
-    episode_outcomes = []  # list of 0/1 for rolling window
-    episode_count = 0
+    episode_outcomes = []  # list of 0/1 for rolling window (last `rolling_window` completed episodes)
+    episode_count = 0  # total episodes completed this stage (lifetime)
+    ep_this_update = 0  # episodes completed in the current update iteration
+    success_this_update = 0  # successes in the current update iteration
     start_time = time.time()
     best_rolling = 0.0
 
@@ -347,6 +376,8 @@ def train_stage(
     for update_idx in range(n_updates):
         # ---- collect n_steps of experience ----
         transitions_list = []
+        ep_this_update = 0
+        success_this_update = 0
 
         for _ in range(ppo_config.n_steps):
             env_states, obs_batch, key, t, dones, successes = vec_step(
@@ -361,7 +392,10 @@ def train_stage(
             for i in range(n_envs):
                 if done_np[i]:
                     episode_count += 1
-                    episode_outcomes.append(1 if success_np[i] else 0)
+                    ep_this_update += 1
+                    outcome = 1 if success_np[i] else 0
+                    success_this_update += outcome
+                    episode_outcomes.append(outcome)
                     # keep only the last `rolling_window` outcomes
                     if len(episode_outcomes) > rolling_window:
                         episode_outcomes.pop(0)
@@ -390,56 +424,81 @@ def train_stage(
             train_state, transitions, next_value, update_key
         )
 
-        # ---- logging ----
-        if update_idx % 10 == 0:
-            rolling_success = sum(episode_outcomes) / max(len(episode_outcomes), 1)
-            if len(episode_outcomes) >= rolling_window:
-                best_rolling = max(best_rolling, rolling_success)
+        # ---- compute rolling success (every update, used for logging + early stop) ----
+        window_len = len(episode_outcomes)
+        win_success = sum(episode_outcomes)  # successes in the window
+        rolling_success = win_success / max(window_len, 1)
+        # best_rolling tracks once we have at least min_episodes worth of data
+        if episode_count >= stage["min_episodes"]:
+            best_rolling = max(best_rolling, rolling_success)
 
+        # ---- logging ----
+        if verbose:
             elapsed = time.time() - start_time
 
-            if verbose:
-                bar_len = 20
-                filled = int(rolling_success * bar_len)
-                bar = "X" * filled + "-" * (bar_len - filled)
-                winfo = f"{len(episode_outcomes)}/{rolling_window}"
-                print(
-                    f"  upd {update_idx:5d} | ep {episode_count:6d} | "
-                    f"roll[{winfo}]=[{bar}] {rolling_success * 100:5.1f}% | "
-                    f"loss={float(metrics['total_loss']):7.4f} | "
-                    f"{elapsed / 60:.1f}m"
-                )
+            # bar: X = success, o = fail, . = empty (window not full yet)
+            bar_len = 20
+            filled_success = int(rolling_success * bar_len)
+            filled_fail = min(
+                bar_len - filled_success,
+                int(
+                    (1.0 - rolling_success)
+                    * bar_len
+                    * (window_len / max(rolling_window, 1))
+                ),
+            )
+            filled_empty = bar_len - filled_success - filled_fail
+            bar = "X" * filled_success + "o" * filled_fail + "." * filled_empty
 
-            # ---- early stop on target ----
-            if (
-                episode_count >= stage["min_episodes"]
-                and len(episode_outcomes) >= rolling_window
-                and rolling_success >= target_rolling
-            ):
-                if verbose:
-                    print(
-                        f"\n  TARGET HIT: rolling {rolling_success * 100:.1f}% >= {target_rolling * 100:.0f}%"
-                    )
-                break
+            print(
+                f"  upd {update_idx:5d} | "
+                f"ep {episode_count:6d} (+{ep_this_update:3d}, {success_this_update}/{ep_this_update} ok) | "
+                f"win [{win_success:3d}/{window_len:3d}]=[{bar}] {rolling_success * 100:5.1f}% | "
+                f"pol={float(metrics.get('policy_loss', 0.0)):8.4f} "
+                f"val={float(metrics.get('value_loss', 0.0)):8.4f} "
+                f"ent={float(metrics.get('entropy', 0.0)):6.4f} | "
+                f"{elapsed / 60:.1f}m",
+                flush=True,
+            )
+
+        # ---- early stop on target (checked every update) ----
+        if (
+            episode_count >= stage["min_episodes"]
+            and window_len >= rolling_window
+            and rolling_success >= target_rolling
+        ):
+            if verbose:
+                print(
+                    f"\n  TARGET HIT: rolling {rolling_success * 100:.1f}% "
+                    f"({win_success}/{window_len} in window) >= {target_rolling * 100:.0f}%",
+                    flush=True,
+                )
+            break
 
         # ---- max episodes ----
         if episode_count >= stage["max_episodes"]:
             if verbose:
-                print(f"\n  Max episodes reached ({stage['max_episodes']})")
+                print(f"\n  Max episodes reached ({stage['max_episodes']})", flush=True)
             break
 
     # --- final stats ---
     final_rolling = sum(episode_outcomes) / max(len(episode_outcomes), 1)
+    final_win_success = sum(episode_outcomes)
+    final_win_len = len(episode_outcomes)
     elapsed = time.time() - start_time
 
     if verbose:
-        print(f"\n{'=' * 60}")
-        print(f"  Stage {stage_idx + 1} (n={n}) done")
-        print(f"  Episodes: {episode_count}")
-        print(f"  Rolling success (last {rolling_window}): {final_rolling * 100:.1f}%")
-        print(f"  Best rolling success: {best_rolling * 100:.1f}%")
-        print(f"  Target was: {target_rolling * 100:.0f}%")
-        print(f"  Time: {elapsed / 60:.1f} min")
+        print(f"\n{'=' * 60}", flush=True)
+        print(f"  Stage {stage_idx + 1} (n={n}) done", flush=True)
+        print(f"  Total episodes completed : {episode_count}", flush=True)
+        print(
+            f"  Window (last {rolling_window}): {final_win_success}/{final_win_len} success "
+            f"= {final_rolling * 100:.1f}%",
+            flush=True,
+        )
+        print(f"  Best rolling success     : {best_rolling * 100:.1f}%", flush=True)
+        print(f"  Target                   : {target_rolling * 100:.0f}%", flush=True)
+        print(f"  Wall time                : {elapsed / 60:.1f} min", flush=True)
 
     # --- checkpoint ---
     ckpt_path = os.path.join(stage_dir, "checkpoint.pkl")
@@ -456,8 +515,8 @@ def train_stage(
             f,
         )
     if verbose:
-        print(f"  Checkpoint: {ckpt_path}")
-        print(f"{'=' * 60}")
+        print(f"  Checkpoint: {ckpt_path}", flush=True)
+        print(f"{'=' * 60}", flush=True)
 
     return train_state.params, final_rolling
 
