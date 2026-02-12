@@ -9,14 +9,16 @@ Key design decisions:
 - Categorical distribution is implemented from scratch (no distrax) to
   avoid version-conflict headaches on TPU images.
 - ActorCritic uses fully-separate policy / value networks (no shared
-  trunk) because the observation is small (32 dims) and separate heads
-  train more stably for this problem.
+  trunk) with LayerNorm for stability at larger n.
 - Gradient clipping is done via optax.clip_by_global_norm (correct L2
   clipping) instead of per-element clipping.
-- GAE is computed with lax.scan in reverse (standard efficient impl).
+- GAE is computed with lax.scan in reverse, PER-ENVIRONMENT to avoid
+  cross-environment contamination.
 - The PPO update loop (epochs x minibatches) is written as nested
   lax.scan so the entire update is a single XLA computation -- no
   Python-level iteration after the first JIT compile.
+- Running observation normalization (Welford's method) matches SB3's
+  VecNormalize.
 """
 
 import jax
@@ -70,15 +72,16 @@ class Categorical:
 
 
 # ============================================
-# Actor-Critic network
+# Actor-Critic network (with LayerNorm)
 # ============================================
 
 
 class ActorCritic(nn.Module):
-    """Separate policy and value MLPs.
+    """Separate policy and value MLPs with LayerNorm for stability.
 
     action_dim : number of discrete actions (49 for MSSA)
-    hidden_dims: tuple of hidden layer widths (default matches SB3 config)
+    hidden_dims: tuple of hidden layer widths (default matches SB3 config:
+                 pi=[512, 512, 256], vf=[512, 512, 256])
     """
 
     action_dim: int
@@ -103,6 +106,7 @@ class ActorCritic(nn.Module):
         h = x
         for dim in self.hidden_dims:
             h = nn.Dense(dim)(h)
+            h = nn.LayerNorm()(h)
             h = nn.relu(h)
         logits = nn.Dense(self.action_dim)(h)  # (..., action_dim)
 
@@ -113,10 +117,69 @@ class ActorCritic(nn.Module):
         v = x
         for dim in self.hidden_dims:
             v = nn.Dense(dim)(v)
+            v = nn.LayerNorm()(v)
             v = nn.relu(v)
         value = nn.Dense(1)(v).squeeze(-1)  # (...,)
 
         return logits, value
+
+
+# ============================================
+# Running observation normalizer
+# (matches SB3 VecNormalize)
+# ============================================
+
+
+class NormalizerState(NamedTuple):
+    """Welford running mean/variance for observation normalization."""
+
+    mean: chex.Array  # (obs_dim,) float32
+    var: chex.Array  # (obs_dim,) float32
+    count: float  # scalar float32
+
+
+def init_normalizer(obs_dim: int) -> NormalizerState:
+    """Create initial normalizer state."""
+    return NormalizerState(
+        mean=jnp.zeros(obs_dim, dtype=jnp.float32),
+        var=jnp.ones(obs_dim, dtype=jnp.float32),
+        count=jnp.float32(1e-4),
+    )
+
+
+@jax.jit
+def update_normalizer(state: NormalizerState, obs_batch: chex.Array) -> NormalizerState:
+    """Update running stats with a batch of observations.
+
+    obs_batch: (B, obs_dim) or (obs_dim,)
+    """
+    obs_batch = jnp.atleast_2d(obs_batch)
+    batch_mean = obs_batch.mean(axis=0)
+    batch_var = obs_batch.var(axis=0)
+    batch_count = jnp.float32(obs_batch.shape[0])
+
+    # Welford parallel update
+    delta = batch_mean - state.mean
+    total_count = state.count + batch_count
+    new_mean = state.mean + delta * batch_count / total_count
+    m_a = state.var * state.count
+    m_b = batch_var * batch_count
+    m2 = m_a + m_b + delta * delta * state.count * batch_count / total_count
+    new_var = m2 / total_count
+
+    return NormalizerState(mean=new_mean, var=new_var, count=total_count)
+
+
+@jax.jit
+def normalize_obs(
+    state: NormalizerState, obs: chex.Array, clip: float = 10.0
+) -> chex.Array:
+    """Normalize observation using running stats (matches VecNormalize)."""
+    return jnp.clip(
+        (obs - state.mean) / jnp.sqrt(state.var + 1e-8),
+        -clip,
+        clip,
+    )
 
 
 # ============================================
@@ -153,7 +216,7 @@ class PPOConfig(NamedTuple):
 
 
 # ============================================
-# GAE
+# GAE (per-environment)
 # ============================================
 
 
@@ -161,12 +224,13 @@ class PPOConfig(NamedTuple):
 def compute_gae(
     rewards: chex.Array,  # (T,)
     values: chex.Array,  # (T,)
-    dones: chex.Array,  # (T,)  bool
+    dones: chex.Array,  # (T,)  float32 (0/1)
     next_value: chex.Array,  # scalar
     gamma: float = 0.99,
     gae_lambda: float = 0.95,
 ) -> Tuple[chex.Array, chex.Array]:
-    """Standard GAE with reverse scan.  Returns (advantages, returns)."""
+    """Standard GAE with reverse scan for ONE environment's trajectory.
+    Returns (advantages, returns), both shape (T,)."""
 
     def _step(carry, t):
         gae, nxt_val = carry
@@ -182,6 +246,39 @@ def compute_gae(
     advantages = advantages_rev[::-1]  # back to forward order
     returns = advantages + values
     return advantages, returns
+
+
+@jax.jit
+def compute_gae_batched(
+    rewards: chex.Array,  # (n_steps, n_envs)
+    values: chex.Array,  # (n_steps, n_envs)
+    dones: chex.Array,  # (n_steps, n_envs) float32
+    next_values: chex.Array,  # (n_envs,) -- per-env bootstrap values
+    gamma: float = 0.99,
+    gae_lambda: float = 0.95,
+) -> Tuple[chex.Array, chex.Array]:
+    """Compute GAE PER-ENVIRONMENT, then flatten.
+
+    Critical fix: GAE must be computed independently for each environment.
+    Interleaving transitions from different environments corrupts advantage
+    estimates because temporal ordering is wrong across environments.
+
+    Returns:
+        advantages: (n_steps * n_envs,)
+        returns:    (n_steps * n_envs,)
+    """
+    # vmap compute_gae over the env dimension (axis=1 -> axis=0 after transpose)
+    # rewards[:, i], values[:, i], dones[:, i], next_values[i] -> per-env GAE
+    per_env_gae = jax.vmap(
+        partial(compute_gae, gamma=gamma, gae_lambda=gae_lambda),
+        in_axes=(1, 1, 1, 0),
+        out_axes=1,
+    )
+    advantages, returns = per_env_gae(rewards, values, dones, next_values)
+    # advantages: (n_steps, n_envs), returns: (n_steps, n_envs)
+
+    # Flatten to (n_steps * n_envs,)
+    return advantages.reshape(-1), returns.reshape(-1)
 
 
 # ============================================
@@ -217,11 +314,11 @@ def make_ppo_update(network: ActorCritic, config: PPOConfig) -> Callable:
     """Factory that returns a JIT-compiled full PPO update function.
 
     The returned function signature:
-        ppo_update(train_state, transitions, next_value, key)
+        ppo_update(train_state, transitions, advantages, returns, key)
             -> (new_train_state, metrics_dict)
 
-    `transitions` is a Transition with leading shape (T * n_envs,)
-    (already flattened by the caller).
+    Caller is responsible for computing GAE with compute_gae_batched
+    and passing pre-computed advantages/returns.
     """
 
     @jax.jit
@@ -275,19 +372,10 @@ def make_ppo_update(network: ActorCritic, config: PPOConfig) -> Callable:
     def ppo_update(
         train_state: TrainState,
         transitions: Transition,  # (B,) flat batch
-        next_value: chex.Array,  # scalar
+        advantages: chex.Array,  # (B,) pre-computed per-env GAE
+        returns: chex.Array,  # (B,) pre-computed per-env returns
         key: chex.PRNGKey,
     ) -> Tuple[TrainState, dict]:
-        # --- GAE ---
-        advantages, returns = compute_gae(
-            transitions.reward,
-            transitions.value,
-            transitions.done.astype(jnp.float32),
-            next_value,
-            config.gamma,
-            config.gae_lambda,
-        )
-
         B = transitions.obs.shape[0]
         minibatch_size = B // config.n_minibatches
 
@@ -320,7 +408,9 @@ def make_ppo_update(network: ActorCritic, config: PPOConfig) -> Callable:
 
 
 # ============================================
-# Rollout collection
+# Rollout collection (single-env, kept for
+# backward compat; curriculum uses vectorised
+# step loop directly)
 # ============================================
 
 
@@ -439,9 +529,18 @@ def train(
         _, next_value = network.apply(train_state.params, obs[None], mask[None])
         next_value = next_value[0]
 
-        # flatten: (n_steps,) already flat for single env
+        # Single-env: compute GAE directly (shape is already (n_steps,))
+        advantages, returns = compute_gae(
+            transitions.reward,
+            transitions.value,
+            transitions.done.astype(jnp.float32),
+            next_value,
+            config.gamma,
+            config.gae_lambda,
+        )
+
         train_state, metrics = ppo_update(
-            train_state, transitions, next_value, update_key
+            train_state, transitions, advantages, returns, update_key
         )
 
         if callback is not None:

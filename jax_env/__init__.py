@@ -21,6 +21,10 @@ def __getattr__(name):
         "get_action_mask",
         "compute_pairwise_norms",
         "check_success",
+        "compute_assignment",
+        "compute_sorted_signatures",
+        "compute_reassigned_diff",
+        "greedy_assignment",
         "NUM_ACTIONS",
     }
     if name in _EXPORTS:

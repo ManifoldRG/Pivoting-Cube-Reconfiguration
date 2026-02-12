@@ -726,6 +726,18 @@ class OGMState(NamedTuple):
     milestone_50: bool  # whether 50% progress bonus was awarded
     milestone_75: bool  # whether 75% progress bonus was awarded
     milestone_90: bool  # whether 90% progress bonus was awarded
+    # Cached sorted signatures for observation/reward consistency
+    # These are updated every step and represent the optimal row-alignment
+    # between current and final configs (permutation-invariant).
+    final_sorted_sigs: (
+        chex.Array
+    )  # (n, n-1) float32 - sorted distance signatures for final config
+    curr_assignment: (
+        chex.Array
+    )  # (n,) int32 - current best row-mapping from curr->final signatures
+    # Soft matching reward state
+    phi_max: float  # running best soft matching score (ratchet)
+    final_sqdist: chex.Array  # (n, n) float32 - cached final squared distances
 
 
 class OGMConfig(NamedTuple):
@@ -736,6 +748,17 @@ class OGMConfig(NamedTuple):
     grid_size: int  # half-width for the dense grid used in validation
     use_unlabeled: bool
     local_k: int
+    # Reward configuration
+    enable_soft_matching: bool = False
+    soft_matching_scale: float = 100.0
+    soft_matching_decay_beta: float = 0.999
+    enable_potential: bool = True
+    potential_scale: float = 1.0
+    success_bonus: float = 100.0
+    step_cost: float = -0.005
+    use_exponential_step_cost: bool = False
+    step_cost_initial: float = -0.01
+    step_cost_min: float = -0.001
 
 
 # ============================================
@@ -920,9 +943,122 @@ def get_action_mask(positions: chex.Array, n: int, grid_size: int) -> chex.Array
 
 
 # ============================================
-# Success check (unlabeled: sorted-row
-# signature matching, equivalent to the
-# Hungarian-based check for distance matrices)
+# Permutation-invariant distance computation
+# (Matches PyTorch's Hungarian-based approach)
+# ============================================
+
+
+@jax.jit
+def compute_sorted_signatures(norms: chex.Array) -> chex.Array:
+    """Compute per-module sorted distance signatures.
+
+    For each module i, its "signature" is the sorted vector of distances
+    to all other modules.  This is permutation-invariant: renaming the
+    modules doesn't change the set of signatures.
+
+    Args:
+        norms: (n, n) pairwise L2 distances
+
+    Returns:
+        (n, n) float32 -- row i is the sorted distances from module i
+        to all modules (including self=0 at position 0).
+    """
+    return jnp.sort(norms, axis=1)  # (n, n)
+
+
+@jax.jit
+def compute_signature_cost_matrix(
+    curr_sigs: chex.Array, final_sigs: chex.Array
+) -> chex.Array:
+    """Compute (n, n) cost matrix for matching current signatures to final signatures.
+
+    cost[i, j] = ||curr_sigs[i] - final_sigs[j]||^2
+
+    This is the JAX equivalent of PyTorch's calc_cost_assignment_matrix.
+    """
+    # curr_sigs: (n, n), final_sigs: (n, n)
+    # Broadcast: (n, 1, n) - (1, n, n) -> (n, n, n) -> sum over last -> (n, n)
+    diff = curr_sigs[:, None, :] - final_sigs[None, :, :]  # (n, n, n)
+    return jnp.sum(diff * diff, axis=-1)  # (n, n)
+
+
+@partial(jax.jit, static_argnums=(1,))
+def greedy_assignment(cost_matrix: chex.Array, n: int) -> chex.Array:
+    """Greedy approximation to the assignment problem (JIT-compatible).
+
+    Uses iterative argmin-based assignment: for each row in order,
+    pick the cheapest unassigned column.  Not optimal but O(n^2) and
+    fully traceable.  For the distance matrices in this problem
+    (where the structure is highly regular), this produces near-optimal
+    assignments.
+
+    Args:
+        cost_matrix: (n, n) float32
+        n: number of items (static)
+
+    Returns:
+        (n,) int32 -- assignment[i] = column assigned to row i
+    """
+    INF = jnp.float32(1e12)
+
+    def _assign_one(carry, row_idx):
+        cost, taken = carry
+        # Mask out already-taken columns
+        masked_cost = jnp.where(taken, INF, cost[row_idx])
+        col = jnp.argmin(masked_cost)
+        taken = taken.at[col].set(True)
+        return (cost, taken), col
+
+    taken = jnp.zeros(n, dtype=jnp.bool_)
+    (_, _), assignments = lax.scan(_assign_one, (cost_matrix, taken), jnp.arange(n))
+    return assignments.astype(jnp.int32)  # (n,)
+
+
+@jax.jit
+def compute_reassigned_diff(
+    curr_norms: chex.Array,
+    final_norms: chex.Array,
+    assignment: chex.Array,
+) -> chex.Array:
+    """Compute (curr_pairwise - reassigned_final_pairwise) using the given assignment.
+
+    This matches PyTorch's calc_rearranged_mat + subtraction.
+    The result is an (n, n) matrix where 0 = goal achieved for that pair.
+
+    Args:
+        curr_norms:  (n, n) current pairwise distances
+        final_norms: (n, n) final pairwise distances
+        assignment:  (n,) int32 mapping curr_row -> final_row
+
+    Returns:
+        (n, n) float32 difference matrix (0 at goal)
+    """
+    # Rearrange final_norms according to assignment:
+    # reassigned[i, j] = final_norms[assignment[i], assignment[j]]
+    reassigned_final = final_norms[assignment][:, assignment]
+    return curr_norms - reassigned_final
+
+
+@partial(jax.jit, static_argnums=(1,))
+def compute_assignment(
+    curr_positions: chex.Array, final_positions: chex.Array, n: int
+) -> chex.Array:
+    """Compute greedy assignment from current to final configuration.
+
+    Returns:
+        (n,) int32 assignment
+    """
+    curr_norms = compute_pairwise_norms(curr_positions)
+    final_norms = compute_pairwise_norms(final_positions)
+    curr_sigs = compute_sorted_signatures(curr_norms)
+    final_sigs = compute_sorted_signatures(final_norms)
+    cost = compute_signature_cost_matrix(curr_sigs, final_sigs)
+    return greedy_assignment(cost, n)
+
+
+# ============================================
+# Success check (unlabeled: consistent with
+# the reassigned pairwise norm approach)
 # ============================================
 
 
@@ -930,13 +1066,17 @@ def get_action_mask(positions: chex.Array, n: int, grid_size: int) -> chex.Array
 def check_success(
     module_positions: chex.Array, final_positions: chex.Array, tol: float = 1e-6
 ) -> bool:
-    """True if the current shape matches the target (up to rigid motion)."""
+    """True if the current shape matches the target (up to permutation).
+
+    Uses sorted-row double-sort signature comparison which is exact for
+    the distance matrices arising from 3D grid positions.
+    """
     curr = compute_pairwise_norms(module_positions)
     final = compute_pairwise_norms(final_positions)
-    # Sort each row -> canonical shape signature
+    # Sort each row -> canonical per-module signature
     curr_sorted = jnp.sort(curr, axis=1)
     final_sorted = jnp.sort(final, axis=1)
-    # Sort the rows themselves so the signature is permutation-invariant
+    # Sort the rows themselves so the overall signature is permutation-invariant
     curr_sig = jnp.sort(curr_sorted, axis=0)
     final_sig = jnp.sort(final_sorted, axis=0)
     return jnp.allclose(curr_sig, final_sig, atol=tol)
@@ -944,28 +1084,80 @@ def check_success(
 
 # ============================================
 # Reward / potential
+# (Uses Frobenius norm of reassigned difference
+#  matrix, matching PyTorch's approach)
 # ============================================
 
 
 @jax.jit
-def compute_potential(
-    module_positions: chex.Array, final_positions: chex.Array
-) -> float:
-    """Potential Phi(s) = - sum |curr_sorted - final_sorted| (row-wise).
+def compute_potential_from_diff(diff_matrix: chex.Array) -> float:
+    """Potential = Frobenius norm of (curr - reassigned_final) pairwise norms.
 
-    Lower (closer to 0) is better; Phi == 0 at success.
+    Matches PyTorch: np.linalg.norm(self.ogm.curr_pairwise_norms, 'fro')
+    where curr_pairwise_norms = current - reassigned_final.
     """
-    curr = compute_pairwise_norms(module_positions)
-    final = compute_pairwise_norms(final_positions)
-    curr_sorted = jnp.sort(curr, axis=1)
-    final_sorted = jnp.sort(final, axis=1)
-    # Sort rows for permutation invariance (matches check_success logic)
-    curr_sig = jnp.sort(curr_sorted, axis=0)
-    final_sig = jnp.sort(final_sorted, axis=0)
-    return jnp.sum(jnp.abs(curr_sig - final_sig))
+    return jnp.linalg.norm(diff_matrix, "fro")
 
 
-@partial(jax.jit, static_argnums=())
+# ============================================
+# Soft matching reward (ported from ogm_env.py)
+# ============================================
+
+
+@jax.jit
+def compute_soft_matching_score(
+    curr_sqdist: chex.Array, final_sqdist: chex.Array
+) -> float:
+    """Compute normalised soft pairwise matching score Φ(M).
+
+    Φ(M) = (2 / (n(n-1))) Σ_{u<v} 1 / (1 + (D_uv - D_uv_goal)²)
+
+    Returns value in (0, 1], where 1 = perfect match.
+    Exact port of OGMEnv.compute_soft_matching_score().
+    """
+    n = curr_sqdist.shape[0]
+    diff = curr_sqdist - final_sqdist
+    scores = 1.0 / (1.0 + diff * diff)
+    # Only count upper triangle (pairs u < v)
+    mask = jnp.triu(jnp.ones((n, n), dtype=jnp.bool_), k=1)
+    total = jnp.sum(scores * mask)
+    return 2.0 * total / jnp.maximum(jnp.float32(n * (n - 1)), 1.0)
+
+
+@jax.jit
+def compute_unlabeled_soft_matching_score(
+    curr_sqdist: chex.Array,
+    final_sqdist: chex.Array,
+    assignment: chex.Array,
+) -> float:
+    """Compute label-agnostic soft matching score using sorted-row signatures.
+
+    Uses the pre-computed assignment to align current and final signatures,
+    then computes per-element soft matching.  Exact port of
+    OGMEnv.compute_unlabeled_soft_matching_score() but JIT-compatible
+    (no scipy).
+
+    Returns value in (0, 1], where 1 = perfect match.
+    """
+    n = curr_sqdist.shape[0]
+    # Sort each row (signatures); keep self-distance (0) which will be at index 0
+    curr_sigs = jnp.sort(curr_sqdist, axis=1)[:, 1:]   # (n, n-1)
+    final_sigs = jnp.sort(final_sqdist, axis=1)[:, 1:]  # (n, n-1)
+    # Align final signatures to current using assignment
+    aligned_final = final_sigs[assignment]  # (n, n-1)
+    diff_sq = (curr_sigs - aligned_final) ** 2
+    scores = 1.0 / (1.0 + diff_sq)
+    return jnp.sum(scores) / jnp.maximum(jnp.float32(n * (n - 1)), 1.0)
+
+
+@jax.jit
+def compute_pairwise_sqdist(positions: chex.Array) -> chex.Array:
+    """Compute (n, n) squared L2 distance matrix."""
+    diff = positions[:, None, :] - positions[None, :, :]  # (n, n, 3)
+    return jnp.sum(diff * diff, axis=-1).astype(jnp.float32)  # (n, n)
+
+
+@partial(jax.jit, static_argnums=(12,))
 def compute_reward(
     prev_positions: chex.Array,
     curr_positions: chex.Array,
@@ -974,97 +1166,123 @@ def compute_reward(
     milestone_50: bool,
     milestone_75: bool,
     milestone_90: bool,
-    step_cost: float = -0.005,
-    potential_scale: float = 1.0,
-    success_bonus: float = 100.0,
-) -> tuple[float, bool, bool, bool]:
-    """Shaped reward: step_cost + potential shaping + success bonus + milestone bonuses.
+    prev_assignment: chex.Array,
+    final_sorted_sigs: chex.Array,
+    phi_max: float,
+    final_sqdist: chex.Array,
+    step_count: int,
+    config: OGMConfig,
+) -> tuple:
+    """Shaped reward: step_cost + potential shaping + soft matching + success + milestones.
 
-    Potential is normalized by n to keep reward scale consistent across
-    curriculum stages (prevents n=8+ from having 4-100× larger shaping signal).
+    Matches PyTorch reward computation with all reward modes:
+    - Potential = Frobenius norm of (curr_pairwise - reassigned_final_pairwise)
+    - Shaping = (prev_potential - curr_potential) / n
+    - Soft matching = w(t) * max(0, Φ(t+1) - Φ_max(t)) (ratchet-style)
+    - Milestone bonuses at 50%, 75%, 90% progress
+    - Exponential or flat step cost
 
-    Milestone bonuses (matches PyTorch baseline):
-    - 50% progress: +10% of success_bonus
-    - 75% progress: +20% of success_bonus
-    - 90% progress: +30% of success_bonus
+    The assignment is updated greedily every step to track the best mapping.
 
     Returns:
-        (reward, new_milestone_50, new_milestone_75, new_milestone_90)
+        (reward, new_m50, new_m75, new_m90, new_assignment, new_phi_max)
     """
     n = prev_positions.shape[0]
-    prev_phi = compute_potential(prev_positions, final_positions)
-    curr_phi = compute_potential(curr_positions, final_positions)
+
+    # Compute norms
+    prev_norms = compute_pairwise_norms(prev_positions)
+    curr_norms = compute_pairwise_norms(curr_positions)
+    final_norms = compute_pairwise_norms(final_positions)
+
+    # Update assignment using current configuration
+    curr_sigs = compute_sorted_signatures(curr_norms)
+    cost = compute_signature_cost_matrix(curr_sigs, final_sorted_sigs)
+    new_assignment = greedy_assignment(cost, n)
+
+    # --- 1. Potential-based shaping reward ---
+    prev_diff = compute_reassigned_diff(prev_norms, final_norms, prev_assignment)
+    curr_diff = compute_reassigned_diff(curr_norms, final_norms, new_assignment)
+    prev_phi = compute_potential_from_diff(prev_diff)
+    curr_phi = compute_potential_from_diff(curr_diff)
 
     # Normalize by n to keep reward scale consistent (critical for curriculum)
-    shaping = potential_scale * (prev_phi - curr_phi) / jnp.float32(n)
-    done = check_success(curr_positions, final_positions)
-    bonus = jnp.where(done, success_bonus, 0.0)
-
-    # Milestone bonuses for partial progress (helps with large n)
-    milestone_bonus = 0.0
-    new_m50, new_m75, new_m90 = milestone_50, milestone_75, milestone_90
-
-    # Only award milestones if not already successful
-    curr_norm_diff = jnp.linalg.norm(
-        compute_pairwise_norms(curr_positions)
-        - compute_pairwise_norms(final_positions),
-        "fro",
-    )
-    progress = jnp.where(
-        initial_norm_diff > 0,
-        1.0 - (curr_norm_diff / initial_norm_diff),
+    potential_reward = jnp.where(
+        config.enable_potential,
+        config.potential_scale * (prev_phi - curr_phi) / jnp.float32(n),
         0.0,
     )
 
-    # Check milestones in descending order (90% -> 75% -> 50%)
-    # Award highest applicable milestone that hasn't been reached yet
-    milestone_bonus = jnp.where(
-        ~done & (progress >= 0.9) & ~milestone_90,
-        success_bonus * 0.3,  # 30 points
-        milestone_bonus,
+    # --- 2. Soft matching reward (ratchet-style, ported from ogm_env.py) ---
+    curr_sqdist = compute_pairwise_sqdist(curr_positions)
+    # Compute phi using labeled or unlabeled mode
+    phi_labeled = compute_soft_matching_score(curr_sqdist, final_sqdist)
+    phi_unlabeled = compute_unlabeled_soft_matching_score(
+        curr_sqdist, final_sqdist, new_assignment
     )
-    new_m90 = jnp.where(
-        ~done & (progress >= 0.9) & ~milestone_90,
-        True,
-        new_m90,
+    phi_current = jnp.where(config.use_unlabeled, phi_unlabeled, phi_labeled)
+
+    # Time decay weight: w(t) = beta^t
+    w_t = config.soft_matching_decay_beta ** step_count
+    # Reward = w(t) * max(0, Φ(t+1) - Φ_max(t)) * scale
+    improvement = phi_current - phi_max
+    soft_reward = jnp.where(
+        config.enable_soft_matching & (improvement > 0),
+        w_t * improvement * config.soft_matching_scale,
+        0.0,
+    )
+    # Update running best
+    new_phi_max = jnp.where(
+        config.enable_soft_matching & (improvement > 0),
+        phi_current,
+        phi_max,
     )
 
-    milestone_bonus = jnp.where(
-        ~done
-        & (progress >= 0.75)
-        & ~milestone_75
-        & ~(~done & (progress >= 0.9) & ~milestone_90),
-        success_bonus * 0.2,  # 20 points
-        milestone_bonus,
-    )
-    new_m75 = jnp.where(
-        ~done
-        & (progress >= 0.75)
-        & ~milestone_75
-        & ~(~done & (progress >= 0.9) & ~milestone_90),
-        True,
-        new_m75,
+    # --- 3. Success bonus ---
+    done = check_success(curr_positions, final_positions)
+    bonus = jnp.where(done, config.success_bonus, 0.0)
+
+    # --- 4. Milestone bonuses for partial progress ---
+    milestone_bonus = jnp.float32(0.0)
+    new_m50, new_m75, new_m90 = milestone_50, milestone_75, milestone_90
+
+    progress = jnp.where(
+        initial_norm_diff > 0,
+        1.0 - (curr_phi / initial_norm_diff),
+        0.0,
     )
 
-    milestone_bonus = jnp.where(
-        ~done
-        & (progress >= 0.5)
-        & ~milestone_50
-        & ~(~done & (progress >= 0.75) & ~milestone_75),
-        success_bonus * 0.1,  # 10 points
-        milestone_bonus,
+    award_90 = ~done & (progress >= 0.9) & ~milestone_90
+    milestone_bonus = jnp.where(award_90, config.success_bonus * 0.3, milestone_bonus)
+    new_m90 = new_m90 | award_90
+
+    award_75 = ~done & (progress >= 0.75) & ~milestone_75 & ~award_90
+    milestone_bonus = jnp.where(award_75, config.success_bonus * 0.2, milestone_bonus)
+    new_m75 = new_m75 | award_75
+
+    award_50 = ~done & (progress >= 0.5) & ~milestone_50 & ~award_75 & ~award_90
+    milestone_bonus = jnp.where(award_50, config.success_bonus * 0.1, milestone_bonus)
+    new_m50 = new_m50 | award_50
+
+    # --- 5. Step cost (flat or exponential decay) ---
+    # Exponential: max(initial * exp(-rate * t), min)
+    # decay_rate = -ln(min / initial) / max_steps
+    decay_rate = jnp.where(
+        config.use_exponential_step_cost & (config.step_cost_initial != 0.0),
+        -jnp.log(jnp.abs(config.step_cost_min / config.step_cost_initial))
+        / jnp.maximum(jnp.float32(config.max_steps), 1.0),
+        0.0,
     )
-    new_m50 = jnp.where(
-        ~done
-        & (progress >= 0.5)
-        & ~milestone_50
-        & ~(~done & (progress >= 0.75) & ~milestone_75),
-        True,
-        new_m50,
+    exp_cost = jnp.maximum(
+        config.step_cost_initial * jnp.exp(-decay_rate * jnp.float32(step_count)),
+        config.step_cost_min,
+    )
+    current_step_cost = jnp.where(
+        config.use_exponential_step_cost, exp_cost, config.step_cost
     )
 
-    total_reward = step_cost + shaping + bonus + milestone_bonus
-    return total_reward, new_m50, new_m75, new_m90
+    # --- Total reward ---
+    total_reward = potential_reward + soft_reward + bonus + milestone_bonus + current_step_cost
+    return total_reward, new_m50, new_m75, new_m90, new_assignment, new_phi_max
 
 
 # ============================================
@@ -1136,10 +1354,34 @@ def reset(key: chex.PRNGKey, config: OGMConfig) -> OGMState:
     init_pos = make_connected_configuration(key1, config.n)
     final_pos = make_connected_configuration(key2, config.n)
 
-    # Calculate initial norm difference for milestone tracking
+    # Compute initial assignment and norm diff (matching PyTorch reset)
     init_norms = compute_pairwise_norms(init_pos)
     final_norms = compute_pairwise_norms(final_pos)
-    initial_norm_diff = jnp.linalg.norm(init_norms - final_norms, "fro")
+
+    # Pre-compute sorted signatures for the final config (static for episode)
+    final_sorted_sigs = compute_sorted_signatures(final_norms)  # (n, n)
+
+    # Initial assignment: curr -> final via greedy signature matching
+    init_sigs = compute_sorted_signatures(init_norms)
+    cost = compute_signature_cost_matrix(init_sigs, final_sorted_sigs)
+    init_assignment = greedy_assignment(cost, config.n)
+
+    # Initial potential = Frobenius norm of reassigned diff (matches PyTorch)
+    init_diff = compute_reassigned_diff(init_norms, final_norms, init_assignment)
+    initial_norm_diff = jnp.linalg.norm(init_diff, "fro")
+
+    # Pre-compute final squared distances for soft matching reward
+    final_sqdist = compute_pairwise_sqdist(final_pos)  # (n, n)
+
+    # Initial soft matching score (phi_max starts at initial value)
+    init_sqdist = compute_pairwise_sqdist(init_pos)
+    phi_labeled = compute_soft_matching_score(init_sqdist, final_sqdist)
+    phi_unlabeled = compute_unlabeled_soft_matching_score(
+        init_sqdist, final_sqdist, init_assignment
+    )
+    init_phi = jnp.where(config.use_unlabeled, phi_unlabeled, phi_labeled)
+    # Only track phi_max when soft matching is enabled
+    init_phi_max = jnp.where(config.enable_soft_matching, init_phi, 0.0)
 
     return OGMState(
         module_positions=init_pos,
@@ -1151,6 +1393,10 @@ def reset(key: chex.PRNGKey, config: OGMConfig) -> OGMState:
         milestone_50=False,
         milestone_75=False,
         milestone_90=False,
+        final_sorted_sigs=final_sorted_sigs,
+        curr_assignment=init_assignment,
+        phi_max=init_phi_max,
+        final_sqdist=final_sqdist,
     )
 
 
@@ -1165,37 +1411,51 @@ def get_observation(
     final_positions: chex.Array,
     agent_idx: int,
     local_k: int,
+    assignment: chex.Array,
 ) -> chex.Array:
     """Flat observation vector of size (local_k * 4 + 4).
 
+    Matches PyTorch observation computation:
+      - Computes (curr_pairwise - reassigned_final_pairwise) using the
+        current assignment (permutation-invariant for unlabeled mode).
+      - Applies four-band reduction and local neighborhood windowing.
+      - Normalises by max grid distance.
+      - Appends 4-dim agent encoding (matching PyTorch's sinusoidal encoding).
+
     Components:
-      - four-band reduction of |curr_norms - final_norms|, local window of k rows
-      - 4-dim sinusoidal agent encoding
+      - four-band reduction of reassigned diff matrix, local window of k rows
+      - 4-dim sinusoidal agent encoding (matching PyTorch exactly)
     """
     n = module_positions.shape[0]
 
+    # Compute reassigned diff matrix (matches PyTorch's curr_pairwise_norms)
     curr_norms = compute_pairwise_norms(module_positions)
     final_norms = compute_pairwise_norms(final_positions)
-    rel_norms = jnp.abs(curr_norms - final_norms)  # (n, n)
+    diff_matrix = compute_reassigned_diff(curr_norms, final_norms, assignment)  # (n, n)
 
-    reduced = calc_four_band_reduction(rel_norms)  # (n, 4)
+    # Apply four-band + local neighborhood reduction (matches PyTorch pipeline)
+    reduced = calc_four_band_reduction(diff_matrix)  # (n, 4)
     local = calc_local_neighborhood(reduced, agent_idx, local_k)  # (k, 4)
 
     obs = local.flatten()  # (k*4,)
 
-    # Normalise by max possible grid distance
-    max_dist = jnp.sqrt(3.0) * 50.0
+    # Normalise by max possible grid distance (matches PyTorch ogm_env.py:496)
+    grid_size = jnp.float32(n * 2 + 3)  # match calculate_grid_size
+    grid_size = jnp.maximum(grid_size, 5.0)
+    max_dist = jnp.sqrt(3.0) * (grid_size - 1.0)
+    max_dist = jnp.maximum(max_dist, 1.0)
     obs = obs / max_dist
 
-    # Agent encoding (4 dims, fixed size)
-    n_f = jnp.float32(n)
-    idx_f = jnp.float32(agent_idx)
+    # Agent encoding (4 dims, matching PyTorch ogm_gym_env.py:92-106)
+    # PyTorch: pos = agent_idx / max(n-1, 1)
+    # [pos, sin(pos*pi), cos(pos*pi), sin(pos*2*pi)]
+    pos = jnp.float32(agent_idx) / jnp.maximum(jnp.float32(n - 1), 1.0)
     agent_enc = jnp.array(
         [
-            jnp.sin(2.0 * jnp.pi * idx_f / n_f),
-            jnp.cos(2.0 * jnp.pi * idx_f / n_f),
-            idx_f / n_f,
-            (n_f - idx_f) / n_f,
+            pos,
+            jnp.sin(pos * jnp.pi),
+            jnp.cos(pos * jnp.pi),
+            jnp.sin(pos * 2.0 * jnp.pi),
         ]
     )
 
@@ -1207,8 +1467,8 @@ def get_observation(
 # ============================================
 
 
-@partial(jax.jit, static_argnums=(2, 3))
-def step_with_action(state: OGMState, action: int, n: int, grid_size: int):
+@partial(jax.jit, static_argnums=(2, 3, 4))
+def step_with_action(state: OGMState, action: int, n: int, grid_size: int, config: OGMConfig = None):
     """Execute action for the current agent and advance turn.
 
     Args:
@@ -1216,6 +1476,7 @@ def step_with_action(state: OGMState, action: int, n: int, grid_size: int):
         action:    integer in [0, 48].  48 = no-op.
         n:         number of modules (static)
         grid_size: half-width of validation grid (static)
+        config:    OGMConfig with reward settings (static)
 
     Returns:
         (new_state, reward, terminated, truncated)
@@ -1231,8 +1492,13 @@ def step_with_action(state: OGMState, action: int, n: int, grid_size: int):
     )
     new_positions = positions.at[agent].add(delta)
 
-    # --- reward (with milestone bonuses) ---
-    reward, new_m50, new_m75, new_m90 = compute_reward(
+    # --- reward (with all configurable reward modes) ---
+    # Use default config if none provided (backward compat)
+    _config = config if config is not None else OGMConfig(
+        n=n, max_steps=1000, grid_size=grid_size,
+        use_unlabeled=True, local_k=7,
+    )
+    reward, new_m50, new_m75, new_m90, new_assignment, new_phi_max = compute_reward(
         positions,
         new_positions,
         state.final_positions,
@@ -1240,6 +1506,12 @@ def step_with_action(state: OGMState, action: int, n: int, grid_size: int):
         state.milestone_50,
         state.milestone_75,
         state.milestone_90,
+        state.curr_assignment,
+        state.final_sorted_sigs,
+        state.phi_max,
+        state.final_sqdist,
+        state.step_count,
+        _config,
     )
 
     # --- termination ---
@@ -1259,6 +1531,10 @@ def step_with_action(state: OGMState, action: int, n: int, grid_size: int):
         milestone_50=new_m50,
         milestone_75=new_m75,
         milestone_90=new_m90,
+        final_sorted_sigs=state.final_sorted_sigs,
+        curr_assignment=new_assignment,
+        phi_max=new_phi_max,
+        final_sqdist=state.final_sqdist,
     )
 
     return new_state, reward, terminated, truncated
@@ -1290,7 +1566,11 @@ class VectorizedOGMEnv:
     def reset(self, key: chex.PRNGKey) -> Tuple[chex.Array, OGMState]:
         state = reset(key, self.config)
         obs = get_observation(
-            state.module_positions, state.final_positions, state.agent_idx, self.local_k
+            state.module_positions,
+            state.final_positions,
+            state.agent_idx,
+            self.local_k,
+            state.curr_assignment,
         )
         return obs, state
 
@@ -1301,7 +1581,7 @@ class VectorizedOGMEnv:
     ) -> Tuple[chex.Array, OGMState, float, bool]:
         """Take one step.  Returns (obs, new_state, reward, done)."""
         new_state, reward, terminated, truncated = step_with_action(
-            state, action, self.n, self.grid_size
+            state, action, self.n, self.grid_size, self.config
         )
         done = terminated | truncated
 
@@ -1310,6 +1590,7 @@ class VectorizedOGMEnv:
             new_state.final_positions,
             new_state.agent_idx,
             self.local_k,
+            new_state.curr_assignment,
         )
         return obs, new_state, reward, done
 

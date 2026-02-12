@@ -397,6 +397,163 @@ class TestConnectedConfig(unittest.TestCase):
 
 
 # ============================================================
+# 8. Soft matching reward
+# ============================================================
+
+
+@_skip_if_no_jax
+class TestSoftMatchingReward(unittest.TestCase):
+    """Verify JAX soft matching scores match NumPy OGMEnv."""
+
+    def test_labeled_soft_matching(self):
+        """JAX compute_soft_matching_score matches OGMEnv.compute_soft_matching_score."""
+        from jax_env.ogm_jax import compute_pairwise_sqdist, compute_soft_matching_score
+        from ogm.ogm_env import OGMEnv
+
+        env = OGMEnv()
+
+        for name, pos_dict, n in CONFIGS:
+            with self.subTest(name=name):
+                pos1 = _positions_to_array(pos_dict)
+                # Create a slightly different config for comparison
+                pos2 = pos1.copy()
+                pos2[0] = pos2[0] + np.array([1, 0, 0])  # shift one module
+
+                # NumPy reference
+                np_sqdist1 = np.zeros((n, n))
+                np_sqdist2 = np.zeros((n, n))
+                for i in range(n):
+                    for j in range(n):
+                        np_sqdist1[i, j] = np.sum((pos1[i] - pos1[j]) ** 2)
+                        np_sqdist2[i, j] = np.sum((pos2[i] - pos2[j]) ** 2)
+                np_score = env.compute_soft_matching_score(np_sqdist1, np_sqdist2)
+
+                # JAX
+                jax_sqdist1 = compute_pairwise_sqdist(jnp.array(pos1))
+                jax_sqdist2 = compute_pairwise_sqdist(jnp.array(pos2))
+                jax_score = float(compute_soft_matching_score(jax_sqdist1, jax_sqdist2))
+
+                self.assertAlmostEqual(
+                    jax_score, np_score, places=5,
+                    msg=f"{name}: JAX={jax_score:.6f} != NumPy={np_score:.6f}",
+                )
+
+    def test_identical_is_one(self):
+        """Soft matching of identical configurations should return 1.0."""
+        from jax_env.ogm_jax import compute_pairwise_sqdist, compute_soft_matching_score
+
+        for name, pos_dict, n in CONFIGS:
+            with self.subTest(name=name):
+                pos = _positions_to_array(pos_dict)
+                sqdist = compute_pairwise_sqdist(jnp.array(pos))
+                score = float(compute_soft_matching_score(sqdist, sqdist))
+                self.assertAlmostEqual(
+                    score, 1.0, places=5,
+                    msg=f"{name}: identical configs should give score=1.0, got {score}",
+                )
+
+    def test_unlabeled_soft_matching(self):
+        """JAX unlabeled soft matching uses assignment correctly."""
+        from jax_env.ogm_jax import (
+            compute_pairwise_sqdist,
+            compute_pairwise_norms,
+            compute_sorted_signatures,
+            compute_signature_cost_matrix,
+            greedy_assignment,
+            compute_unlabeled_soft_matching_score,
+        )
+
+        for name, pos_dict, n in CONFIGS:
+            with self.subTest(name=name):
+                pos = _positions_to_array(pos_dict)
+                pos_jax = jnp.array(pos)
+
+                sqdist = compute_pairwise_sqdist(pos_jax)
+                norms = compute_pairwise_norms(pos_jax)
+                sigs = compute_sorted_signatures(norms)
+                cost = compute_signature_cost_matrix(sigs, sigs)
+                assignment = greedy_assignment(cost, n)
+
+                # Identity assignment on same config should give score=1.0
+                score = float(compute_unlabeled_soft_matching_score(
+                    sqdist, sqdist, assignment
+                ))
+                self.assertAlmostEqual(
+                    score, 1.0, places=4,
+                    msg=f"{name}: self-match should give ~1.0, got {score}",
+                )
+
+
+# ============================================================
+# 9. Reward computation (end-to-end)
+# ============================================================
+
+
+@_skip_if_no_jax
+class TestRewardComputation(unittest.TestCase):
+    """Verify compute_reward runs without errors and produces reasonable values."""
+
+    def test_reward_runs(self):
+        """compute_reward should execute without tracing errors."""
+        from jax_env.ogm_jax import (
+            OGMConfig,
+            compute_reward,
+            compute_pairwise_norms,
+            compute_pairwise_sqdist,
+            compute_sorted_signatures,
+            compute_signature_cost_matrix,
+            greedy_assignment,
+        )
+
+        for name, pos_dict, n in CONFIGS:
+            with self.subTest(name=name):
+                pos = jnp.array(_positions_to_array(pos_dict), dtype=jnp.int32)
+                # Shift one module for "current" configuration
+                curr_pos = pos.at[0].add(jnp.array([1, 0, 0]))
+
+                norms_init = compute_pairwise_norms(pos)
+                norms_final = compute_pairwise_norms(pos)
+                final_sigs = compute_sorted_signatures(norms_final)
+                init_sigs = compute_sorted_signatures(norms_init)
+                cost = compute_signature_cost_matrix(init_sigs, final_sigs)
+                assignment = greedy_assignment(cost, n)
+                final_sqdist = compute_pairwise_sqdist(pos)
+
+                from jax_env.ogm_jax import compute_reassigned_diff
+                init_diff = compute_reassigned_diff(norms_init, norms_final, assignment)
+                initial_norm_diff = float(jnp.linalg.norm(init_diff, "fro"))
+
+                config = OGMConfig(
+                    n=n, max_steps=1000, grid_size=max(5, n * 2 + 3),
+                    use_unlabeled=True, local_k=min(7, n),
+                    enable_soft_matching=True, enable_potential=True,
+                )
+
+                reward, m50, m75, m90, new_assgn, new_phi = compute_reward(
+                    pos, curr_pos, pos,
+                    initial_norm_diff,
+                    False, False, False,
+                    assignment, final_sigs,
+                    0.5,  # phi_max
+                    final_sqdist,
+                    jnp.int32(0),  # step_count
+                    config,
+                )
+
+                # Reward should be finite
+                self.assertTrue(
+                    np.isfinite(float(reward)),
+                    f"{name}: reward is not finite: {float(reward)}",
+                )
+                # Assignment should be valid indices
+                assgn_np = np.array(new_assgn)
+                self.assertTrue(
+                    np.all(assgn_np >= 0) and np.all(assgn_np < n),
+                    f"{name}: invalid assignment indices",
+                )
+
+
+# ============================================================
 # Main
 # ============================================================
 

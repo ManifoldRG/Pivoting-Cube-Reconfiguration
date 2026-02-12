@@ -7,10 +7,19 @@ curriculum learning.  Each stage:
   2. Initialises (or loads) an ActorCritic network.
   3. Runs vectorised rollout collection across n_envs parallel
      environments using vmap over the single-env rollout fn.
-  4. Concatenates all transitions and runs a batched PPO update.
-  5. Tracks a rolling success rate (last ROLLING_WINDOW episodes).
-  6. Advances to the next stage once the rolling success rate
+  4. Computes GAE PER-ENVIRONMENT (critical: avoids cross-env contamination).
+  5. Concatenates all transitions and runs a batched PPO update.
+  6. Tracks a rolling success rate (last ROLLING_WINDOW episodes).
+  7. Advances to the next stage once the rolling success rate
      exceeds the stage target (or max_episodes is reached).
+
+Key fixes vs previous version:
+  - Step budget: max_steps = phases * n (matches PyTorch semantics)
+  - GAE computed per-environment, not on interleaved buffer
+  - Per-env bootstrap values (not averaged)
+  - Observation normalization (running mean/var, matches VecNormalize)
+  - Host round-trips minimized (batch done/success extraction after rollout)
+  - Network dims aligned with PyTorch (512, 512, 256)
 
 Usage:
     python train_jax/train_curriculum.py --target_n 50 --n_envs 256
@@ -33,6 +42,7 @@ import sys
 import argparse
 from datetime import datetime
 import pickle
+from torch.utils.tensorboard import SummaryWriter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -42,9 +52,13 @@ from train_jax.ppo_jax import (
     PPOConfig,
     Transition,
     Categorical,
+    NormalizerState,
+    init_normalizer,
+    update_normalizer,
+    normalize_obs,
     create_train_state,
     make_ppo_update,
-    make_rollout_fn,
+    compute_gae_batched,
 )
 
 
@@ -55,111 +69,113 @@ from train_jax.ppo_jax import (
 ROLLING_WINDOW_SIZE = 100
 DEFAULT_ADVANCE_THRESHOLD = 0.85
 
+# Step budgets now use: phases_per_agent * n = total individual agent actions
+# This matches PyTorch where max_steps = phases, and OGMEnv gets phases * n.
 CURRICULUM_STAGES: List[Dict] = [
-    # Stage 0: n=4 (baseline)
+    # Stage 0: n=4  (150 phases/agent => 600 phases => 2400 individual steps)
     {
         "n": 4,
-        "max_steps": 600,
+        "phases_per_episode": 600,  # phases (all-agents-act-once)
         "min_episodes": 500,
         "max_episodes": 2000,
-        "target_rolling_success": 0.90,  # PyTorch target
+        "target_rolling_success": 0.90,
         "lr": 5e-4,
         "entropy": 0.03,
     },
-    # Stage 1: n=5
+    # Stage 1: n=5  (150 phases/agent => 750 phases => 3750 individual steps)
     {
         "n": 5,
-        "max_steps": 750,
+        "phases_per_episode": 750,
         "min_episodes": 500,
         "max_episodes": 2500,
-        "target_rolling_success": 0.88,  # PyTorch target
+        "target_rolling_success": 0.88,
         "lr": 4.5e-4,
         "entropy": 0.03,
     },
     # Stage 2: n=6
     {
         "n": 6,
-        "max_steps": 900,
+        "phases_per_episode": 900,
         "min_episodes": 600,
         "max_episodes": 2500,
-        "target_rolling_success": 0.85,  # PyTorch target
+        "target_rolling_success": 0.85,
         "lr": 4e-4,
         "entropy": 0.03,
     },
     # Stage 3: n=7
     {
         "n": 7,
-        "max_steps": 1050,  # PyTorch: 150 steps/agent
+        "phases_per_episode": 1050,
         "min_episodes": 600,
         "max_episodes": 3000,
-        "target_rolling_success": 0.80,  # PyTorch target (was 0.85)
+        "target_rolling_success": 0.80,
         "lr": 3.5e-4,
         "entropy": 0.03,
     },
-    # Stage 4: n=8 (CRITICAL - match PyTorch + increase budget)
+    # Stage 4: n=8 (CRITICAL - 175 phases/agent => 1400 phases => 11200 steps)
     {
         "n": 8,
-        "max_steps": 1600,  # PyTorch: 1400, increased for better convergence
-        "min_episodes": 1000,  # PyTorch: 750, increased
-        "max_episodes": 6000,  # PyTorch: 4000, increased (2× budget)
-        "target_rolling_success": 0.75,  # PyTorch target (was 0.85)
-        "lr": 3e-4,  # PyTorch LR (was 1e-4 ❌)
-        "entropy": 0.035,  # PyTorch entropy (was 0.05)
+        "phases_per_episode": 1400,
+        "min_episodes": 1000,
+        "max_episodes": 6000,
+        "target_rolling_success": 0.75,
+        "lr": 3e-4,
+        "entropy": 0.035,
     },
     # Stage 5: n=10
     {
         "n": 10,
-        "max_steps": 2000,  # PyTorch: 1800, increased
-        "min_episodes": 1200,  # PyTorch: 800, increased
-        "max_episodes": 6000,  # PyTorch: 4500, increased
-        "target_rolling_success": 0.75,  # Target 75% (PyTorch: 0.70)
-        "lr": 2.5e-4,  # PyTorch LR
+        "phases_per_episode": 1800,
+        "min_episodes": 1200,
+        "max_episodes": 6000,
+        "target_rolling_success": 0.75,
+        "lr": 2.5e-4,
         "entropy": 0.03,
     },
-    # Stage 6: n=12 (NEW - target ≥75%)
+    # Stage 6: n=12
     {
         "n": 12,
-        "max_steps": 2400,  # PyTorch had continuation to n=15, adapting
-        "min_episodes": 1500,  # PyTorch: 1000, increased
-        "max_episodes": 7000,  # PyTorch: 5000, increased
-        "target_rolling_success": 0.75,  # Target 75% (PyTorch: 0.65)
-        "lr": 2e-4,  # PyTorch LR
-        "entropy": 0.025,  # PyTorch entropy
+        "phases_per_episode": 2200,
+        "min_episodes": 1500,
+        "max_episodes": 7000,
+        "target_rolling_success": 0.70,
+        "lr": 2e-4,
+        "entropy": 0.025,
     },
-    # Stage 7: n=15 (for future extension)
+    # Stage 7: n=15
     {
         "n": 15,
-        "max_steps": 3000,
+        "phases_per_episode": 3000,
         "min_episodes": 2000,
         "max_episodes": 8000,
-        "target_rolling_success": 0.70,
+        "target_rolling_success": 0.65,
         "lr": 1.5e-4,
         "entropy": 0.02,
     },
     # Stage 8: n=20
     {
         "n": 20,
-        "max_steps": 4000,
+        "phases_per_episode": 4000,
         "min_episodes": 3000,
         "max_episodes": 10000,
-        "target_rolling_success": 0.65,
+        "target_rolling_success": 0.60,
         "lr": 1e-4,
         "entropy": 0.015,
     },
     # Stage 9: n=30
     {
         "n": 30,
-        "max_steps": 6000,
+        "phases_per_episode": 6000,
         "min_episodes": 4000,
         "max_episodes": 12000,
-        "target_rolling_success": 0.60,
+        "target_rolling_success": 0.55,
         "lr": 8e-5,
         "entropy": 0.01,
     },
-    # Stage 10: n=50 (final goal)
+    # Stage 10: n=50
     {
         "n": 50,
-        "max_steps": 10000,
+        "phases_per_episode": 10000,
         "min_episodes": 5000,
         "max_episodes": 15000,
         "target_rolling_success": 0.50,
@@ -174,25 +190,39 @@ CURRICULUM_STAGES: List[Dict] = [
 # ============================================
 
 
-def make_env(stage: Dict, local_k: Optional[int] = None) -> VectorizedOGMEnv:
+def make_env(stage: Dict, local_k: Optional[int] = None, reward_kwargs: Optional[Dict] = None) -> VectorizedOGMEnv:
     """Create OGM environment for the given curriculum stage.
 
-    Args:
-        stage: dict with 'n', 'max_steps', etc.
-        local_k: number of rows in observation window. If None, defaults to stage['n']
-                 (full visibility of all modules). Original default was 7.
+    Step budget fix (D12): max_steps = phases_per_episode * n
+    This matches PyTorch where OGMEnv max_steps = phases * num_agents.
     """
     if local_k is None:
         local_k = stage["n"]
 
     assert isinstance(local_k, int), "local_k must be int after None check"
 
+    n = stage["n"]
+    # max_steps in the JAX env counts individual agent actions
+    max_steps = stage["phases_per_episode"] * n
+
+    # Build reward config kwargs
+    rk = reward_kwargs or {}
     config = OGMConfig(
-        n=stage["n"],
-        max_steps=stage["max_steps"],
-        grid_size=max(5, stage["n"] * 2 + 3),  # match NumPy calculate_grid_size
+        n=n,
+        max_steps=max_steps,
+        grid_size=max(5, n * 2 + 3),  # match NumPy calculate_grid_size
         use_unlabeled=True,
         local_k=local_k,
+        enable_soft_matching=rk.get("enable_soft_matching", False),
+        soft_matching_scale=rk.get("soft_matching_scale", 100.0),
+        soft_matching_decay_beta=rk.get("soft_matching_decay_beta", 0.999),
+        enable_potential=rk.get("enable_potential", True),
+        potential_scale=rk.get("potential_scale", 1.0),
+        success_bonus=rk.get("success_bonus", 100.0),
+        step_cost=rk.get("step_cost", -0.005),
+        use_exponential_step_cost=rk.get("use_exponential_step_cost", False),
+        step_cost_initial=rk.get("step_cost_initial", -0.01),
+        step_cost_min=rk.get("step_cost_min", -0.001),
     )
     return VectorizedOGMEnv(config)
 
@@ -220,11 +250,21 @@ def make_ppo_config(stage: Dict) -> PPOConfig:
 
 
 def _make_vectorised_step(env: VectorizedOGMEnv, network: ActorCritic):
-    """Return a JIT-compiled function that does ONE step across n_envs."""
+    """Return a JIT-compiled function that does ONE step across n_envs.
+
+    Observations are normalized using the running normalizer state.
+    """
 
     @jax.jit
-    def vec_step(train_state, env_states, obs_batch, key):
+    def vec_step(train_state, env_states, obs_batch, norm_state, key):
         """Single environment-step for all envs in parallel.
+
+        Args:
+            train_state: Flax TrainState
+            env_states: batched OGMState
+            obs_batch: (n_envs, obs_dim) raw observations
+            norm_state: NormalizerState for obs normalization
+            key: PRNG key
 
         Returns:
             (env_states, obs_batch, key,
@@ -234,11 +274,14 @@ def _make_vectorised_step(env: VectorizedOGMEnv, network: ActorCritic):
         n_envs = obs_batch.shape[0]
         key, action_key = jax.random.split(key)
 
+        # --- normalize observations ---
+        obs_normed = normalize_obs(norm_state, obs_batch)
+
         # --- action masks for all envs (vmap over env) ---
         action_masks = jax.vmap(env.get_action_mask)(env_states)  # (n_envs, 49)
 
-        # --- forward pass (batched) ---
-        logits, values = network.apply(train_state.params, obs_batch, action_masks)
+        # --- forward pass (batched) with normalized obs ---
+        logits, values = network.apply(train_state.params, obs_normed, action_masks)
         # logits: (n_envs, 49), values: (n_envs,)
 
         # --- sample actions ---
@@ -255,9 +298,6 @@ def _make_vectorised_step(env: VectorizedOGMEnv, network: ActorCritic):
         )  # all (n_envs, ...)
 
         # --- detect successes BEFORE auto-reset ---
-        # success = done AND not truncated.  We approximate: if done and
-        # the potential is ~0 we call it a success.  A simpler proxy:
-        # check_success on the NEW positions (before reset overwrites them).
         successes = jax.vmap(check_success)(
             next_states.module_positions,
             next_states.final_positions,
@@ -277,8 +317,9 @@ def _make_vectorised_step(env: VectorizedOGMEnv, network: ActorCritic):
             next_states,
         )
 
+        # Store NORMALIZED obs in transition (what the network actually saw)
         t = Transition(
-            obs=obs_batch,
+            obs=obs_normed,
             action=actions,
             reward=rewards,
             done=dones,
@@ -301,23 +342,29 @@ def train_stage(
     stage: Dict,
     stage_idx: int,
     prev_params: Optional[dict] = None,
+    prev_norm_state: Optional[NormalizerState] = None,
     log_dir: str = "runs/jax_curriculum",
     local_k: Optional[int] = None,  # None = use stage["n"] (full visibility)
     n_envs: int = 256,
     key: Optional[jax.Array] = None,
     verbose: bool = True,
     rolling_window: int = ROLLING_WINDOW_SIZE,
-) -> Tuple[dict, float]:
-    """Train one curriculum stage.  Returns (final_params, rolling_success)."""
+    reward_kwargs: Optional[Dict] = None,
+    writer: Optional[SummaryWriter] = None,
+    global_step_offset: int = 0,
+) -> Tuple[dict, float, NormalizerState, int]:
+    """Train one curriculum stage.  Returns (final_params, rolling_success, norm_state, next_offset)."""
 
     if key is None:
         key = jax.random.PRNGKey(42)
 
     n = stage["n"]
+    max_steps_total = stage["phases_per_episode"] * n
 
     # --- setup ---
-    env = make_env(stage, local_k)
-    network = ActorCritic(action_dim=NUM_ACTIONS, hidden_dims=(1024, 1024, 512))
+    env = make_env(stage, local_k, reward_kwargs)
+    # Network dims match PyTorch: pi=[512, 512, 256], vf=[512, 512, 256]
+    network = ActorCritic(action_dim=NUM_ACTIONS, hidden_dims=(512, 512, 256))
     ppo_config = make_ppo_config(stage)
 
     stage_dir = os.path.join(log_dir, f"stage_n{n}")
@@ -334,9 +381,10 @@ def train_stage(
         )
         print(f"  LR={stage['lr']:.2e}  ent={stage['entropy']}", flush=True)
         print(
-            f"  max_steps={stage['max_steps']}  max_episodes={stage['max_episodes']}",
+            f"  max_steps={max_steps_total} ({stage['phases_per_episode']} phases x {n} agents)",
             flush=True,
         )
+        print(f"  max_episodes={stage['max_episodes']}", flush=True)
         print(f"  Parallel envs: {n_envs}", flush=True)
         print(f"  JAX devices: {jax.devices()}", flush=True)
         print(f"{'=' * 60}", flush=True)
@@ -350,93 +398,130 @@ def train_stage(
             print("  Loading params from previous stage...", flush=True)
         train_state = train_state.replace(params=prev_params)
 
+    # --- initialise observation normalizer ---
+    if prev_norm_state is not None:
+        norm_state = prev_norm_state
+        if verbose:
+            print("  Loaded normalizer state from previous stage", flush=True)
+    else:
+        norm_state = init_normalizer(env.obs_dim)
+
     # --- initialise environments ---
     all_init_keys = jax.random.split(key, n_envs + 1)  # (n_envs+1, 2)
     key = all_init_keys[0]
     env_keys = all_init_keys[1:]  # (n_envs, 2)
     obs_batch, env_states = jax.vmap(env.reset)(env_keys)  # (n_envs, obs_dim), states
 
+    # Warm up normalizer with initial observations
+    norm_state = update_normalizer(norm_state, obs_batch)
+
     # --- compile step & update fns ---
     vec_step = _make_vectorised_step(env, network)
     ppo_update = make_ppo_update(network, ppo_config)
 
     # --- tracking ---
-    episode_outcomes = []  # list of 0/1 for rolling window (last `rolling_window` completed episodes)
-    episode_count = 0  # total episodes completed this stage (lifetime)
-    ep_this_update = 0  # episodes completed in the current update iteration
-    success_this_update = 0  # successes in the current update iteration
+    episode_outcomes = []  # list of 0/1 for rolling window
+    episode_count = 0
+    ep_this_update = 0
+    success_this_update = 0
     start_time = time.time()
     best_rolling = 0.0
 
     steps_per_update = ppo_config.n_steps * n_envs
-    total_budget = stage["max_episodes"] * stage["max_steps"]
+    total_budget = stage["max_episodes"] * max_steps_total
     n_updates = total_budget // steps_per_update
+    global_step = global_step_offset
 
     # --- main loop ---
     for update_idx in range(n_updates):
         # ---- collect n_steps of experience ----
         transitions_list = []
+        all_dones_list = []
+        all_successes_list = []
         ep_this_update = 0
         success_this_update = 0
 
         for _ in range(ppo_config.n_steps):
             env_states, obs_batch, key, t, dones, successes = vec_step(
-                train_state, env_states, obs_batch, key
+                train_state, env_states, obs_batch, norm_state, key
             )
 
             transitions_list.append(t)
+            all_dones_list.append(dones)
+            all_successes_list.append(successes)
 
-            # track episodes that finished this step
-            done_np = dones.tolist()  # materialise to host
-            success_np = successes.tolist()
-            for i in range(n_envs):
-                if done_np[i]:
+            # Update normalizer with new raw observations
+            norm_state = update_normalizer(norm_state, obs_batch)
+
+        # ---- extract episode outcomes (batch transfer to host) ----
+        # Stack dones/successes: (n_steps, n_envs)
+        all_dones = jnp.stack(all_dones_list, axis=0)  # (n_steps, n_envs)
+        all_successes = jnp.stack(all_successes_list, axis=0)
+
+        # Transfer to host once (not per-step)
+        dones_np = all_dones.tolist()
+        successes_np = all_successes.tolist()
+
+        for step_idx in range(ppo_config.n_steps):
+            for env_idx in range(n_envs):
+                if dones_np[step_idx][env_idx]:
                     episode_count += 1
                     ep_this_update += 1
-                    outcome = 1 if success_np[i] else 0
+                    outcome = 1 if successes_np[step_idx][env_idx] else 0
                     success_this_update += outcome
                     episode_outcomes.append(outcome)
-                    # keep only the last `rolling_window` outcomes
                     if len(episode_outcomes) > rolling_window:
                         episode_outcomes.pop(0)
 
-        # ---- stack & flatten transitions ----
-        # Each element of transitions_list is a Transition with leading (n_envs,)
-        # Stack -> (n_steps, n_envs, ...) then reshape -> (n_steps*n_envs, ...)
-        transitions = jax.tree.map(
+        # ---- stack transitions: (n_steps, n_envs, ...) ----
+        transitions_stacked = jax.tree.map(
             lambda *xs: jnp.stack(xs, axis=0), *transitions_list
         )  # (n_steps, n_envs, ...)
-        transitions = jax.tree.map(
-            lambda x: x.reshape(-1, *x.shape[2:]) if x.ndim > 2 else x.reshape(-1),
-            transitions,
-        )  # (n_steps*n_envs, ...)
 
-        # ---- bootstrap value ----
+        # ---- compute GAE PER-ENVIRONMENT (critical fix D6+D7) ----
+        # Bootstrap values: per-env (not averaged!)
+        obs_normed = normalize_obs(norm_state, obs_batch)
         action_masks = jax.vmap(env.get_action_mask)(env_states)  # (n_envs, 49)
         _, next_values = network.apply(
-            train_state.params, obs_batch, action_masks
+            train_state.params, obs_normed, action_masks
         )  # (n_envs,)
-        next_value = next_values.mean()  # scalar
+
+        # Extract (n_steps, n_envs) shaped arrays for per-env GAE
+        rewards_2d = transitions_stacked.reward  # (n_steps, n_envs)
+        values_2d = transitions_stacked.value  # (n_steps, n_envs)
+        dones_2d = transitions_stacked.done.astype(jnp.float32)  # (n_steps, n_envs)
+
+        advantages, returns = compute_gae_batched(
+            rewards_2d,
+            values_2d,
+            dones_2d,
+            next_values,
+            ppo_config.gamma,
+            ppo_config.gae_lambda,
+        )  # Both (n_steps * n_envs,)
+
+        # Flatten transitions to (n_steps*n_envs, ...)
+        transitions_flat = jax.tree.map(
+            lambda x: x.reshape(-1, *x.shape[2:]) if x.ndim > 2 else x.reshape(-1),
+            transitions_stacked,
+        )
 
         # ---- PPO update ----
         key, update_key = jax.random.split(key)
         train_state, metrics = ppo_update(
-            train_state, transitions, next_value, update_key
+            train_state, transitions_flat, advantages, returns, update_key
         )
 
-        # ---- compute rolling success (every update, used for logging + early stop) ----
+        # ---- compute rolling success ----
         window_len = len(episode_outcomes)
-        win_success = sum(episode_outcomes)  # successes in the window
+        win_success = sum(episode_outcomes)
         rolling_success = win_success / max(window_len, 1)
-        # best_rolling tracks once we have at least min_episodes worth of data
         if episode_count >= stage["min_episodes"]:
             best_rolling = max(best_rolling, rolling_success)
 
         # ---- logging ----
-        if verbose:
+        if verbose and (update_idx % 5 == 0 or ep_this_update > 0):
             elapsed = time.time() - start_time
-
-            # bar: X = success, o = fail, . = empty (window not full yet)
             bar_len = 20
             filled_success = int(rolling_success * bar_len)
             filled_fail = min(
@@ -461,7 +546,18 @@ def train_stage(
                 flush=True,
             )
 
-        # ---- early stop on target (checked every update) ----
+        # ---- tensorboard logging ----
+        if writer is not None:
+            global_step += steps_per_update
+            writer.add_scalar(f"stage_n{n}/rolling_success", rolling_success, global_step)
+            writer.add_scalar(f"stage_n{n}/policy_loss", float(metrics.get("policy_loss", 0.0)), global_step)
+            writer.add_scalar(f"stage_n{n}/value_loss", float(metrics.get("value_loss", 0.0)), global_step)
+            writer.add_scalar(f"stage_n{n}/entropy", float(metrics.get("entropy", 0.0)), global_step)
+            writer.add_scalar(f"stage_n{n}/reward", float(metrics.get("total_loss", 0.0)), global_step) # actually total loss, but useful
+            if ep_this_update > 0:
+                writer.add_scalar(f"stage_n{n}/success_rate_this_update", success_this_update / ep_this_update, global_step)
+
+        # ---- early stop on target ----
         if (
             episode_count >= stage["min_episodes"]
             and window_len >= rolling_window
@@ -506,6 +602,7 @@ def train_stage(
         pickle.dump(
             {
                 "params": train_state.params,
+                "norm_state": norm_state,
                 "stage": stage,
                 "rolling_success_rate": final_rolling,
                 "best_rolling_success": best_rolling,
@@ -518,7 +615,7 @@ def train_stage(
         print(f"  Checkpoint: {ckpt_path}", flush=True)
         print(f"{'=' * 60}", flush=True)
 
-    return train_state.params, final_rolling
+    return train_state.params, final_rolling, norm_state, global_step
 
 
 # ============================================
@@ -534,6 +631,8 @@ def run_curriculum(
     n_envs: int = 256,
     load_checkpoint: Optional[str] = None,
     verbose: bool = True,
+    reward_kwargs: Optional[Dict] = None,
+    use_tensorboard: bool = True,
 ):
     if log_dir is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -556,30 +655,39 @@ def run_curriculum(
 
     # --- optional checkpoint load ---
     prev_params = None
+    prev_norm_state = None
     if load_checkpoint and os.path.exists(load_checkpoint):
         with open(load_checkpoint, "rb") as f:
             ckpt = pickle.load(f)
         prev_params = ckpt["params"]
+        prev_norm_state = ckpt.get("norm_state", None)
         if verbose:
             print(f"  Loaded checkpoint: {load_checkpoint}")
 
     key = jax.random.PRNGKey(42)
+    writer = SummaryWriter(log_dir) if use_tensorboard else None
+    global_step_offset = 0
 
     for i, stage in enumerate(stages[start_stage:], start=start_stage):
         key, stage_key = jax.random.split(key)
 
-        params, success_rate = train_stage(
+        params, success_rate, norm_state, global_step_offset = train_stage(
             stage=stage,
             stage_idx=i,
             prev_params=prev_params,
+            prev_norm_state=prev_norm_state,
             log_dir=log_dir,
             local_k=local_k,
             n_envs=n_envs,
             key=stage_key,
             verbose=verbose,
+            reward_kwargs=reward_kwargs,
+            writer=writer,
+            global_step_offset=global_step_offset,
         )
 
         prev_params = params
+        prev_norm_state = norm_state
 
         # warn if far below target
         target = stage.get("target_rolling_success", DEFAULT_ADVANCE_THRESHOLD)
@@ -590,6 +698,9 @@ def run_curriculum(
                     f"< 80% of target {target * 100:.0f}%. "
                     f"Consider tuning hyperparameters or training longer."
                 )
+
+    if writer:
+        writer.close()
 
     if verbose:
         print(f"\n{'=' * 60}")
@@ -613,8 +724,39 @@ def main():
     parser.add_argument("--n_envs", type=int, default=256)
     parser.add_argument("--load_checkpoint", type=str, default=None)
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--no_tensorboard", action="store_true",
+                        help="Disable TensorBoard logging")
+    # Reward configuration
+    parser.add_argument("--enable_soft_matching", action="store_true",
+                        help="Enable soft matching reward")
+    parser.add_argument("--soft_matching_scale", type=float, default=100.0)
+    parser.add_argument("--soft_matching_decay_beta", type=float, default=0.999)
+    parser.add_argument("--enable_potential", action="store_true", default=True,
+                        help="Enable potential-based shaping (default: on)")
+    parser.add_argument("--no_potential", action="store_true",
+                        help="Disable potential-based shaping")
+    parser.add_argument("--potential_scale", type=float, default=1.0)
+    parser.add_argument("--success_bonus", type=float, default=100.0)
+    parser.add_argument("--step_cost", type=float, default=-0.005)
+    parser.add_argument("--use_exponential_step_cost", action="store_true")
+    parser.add_argument("--step_cost_initial", type=float, default=-0.01)
+    parser.add_argument("--step_cost_min", type=float, default=-0.001)
 
     args = parser.parse_args()
+
+    # Build reward kwargs dict
+    reward_kwargs = {
+        "enable_soft_matching": args.enable_soft_matching,
+        "soft_matching_scale": args.soft_matching_scale,
+        "soft_matching_decay_beta": args.soft_matching_decay_beta,
+        "enable_potential": not args.no_potential,
+        "potential_scale": args.potential_scale,
+        "success_bonus": args.success_bonus,
+        "step_cost": args.step_cost,
+        "use_exponential_step_cost": args.use_exponential_step_cost,
+        "step_cost_initial": args.step_cost_initial,
+        "step_cost_min": args.step_cost_min,
+    }
 
     run_curriculum(
         start_stage=args.start_stage,
@@ -624,6 +766,8 @@ def main():
         n_envs=args.n_envs,
         load_checkpoint=args.load_checkpoint,
         verbose=not args.quiet,
+        reward_kwargs=reward_kwargs,
+        use_tensorboard=not args.no_tensorboard,
     )
 
 
