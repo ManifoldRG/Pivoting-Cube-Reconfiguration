@@ -327,6 +327,7 @@ def make_ppo_update(network: ActorCritic, config: PPOConfig) -> Callable:
         batch: Transition,
         advantages: chex.Array,
         returns: chex.Array,
+        ent_coef: float,
     ) -> Tuple[TrainState, dict]:
         """One gradient step on a minibatch."""
 
@@ -337,10 +338,8 @@ def make_ppo_update(network: ActorCritic, config: PPOConfig) -> Callable:
             log_prob_new = pi.log_prob(batch.action)
             ratio = jnp.exp(log_prob_new - batch.log_prob)
 
-            # normalise advantages within minibatch
             adv_norm = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-            # clipped surrogate
             pg1 = -adv_norm * ratio
             pg2 = -adv_norm * jnp.clip(
                 ratio, 1.0 - config.clip_eps, 1.0 + config.clip_eps
@@ -350,9 +349,7 @@ def make_ppo_update(network: ActorCritic, config: PPOConfig) -> Callable:
             value_loss = 0.5 * jnp.mean((value - returns) ** 2)
             entropy = pi.entropy().mean()
 
-            total_loss = (
-                policy_loss + config.vf_coef * value_loss - config.ent_coef * entropy
-            )
+            total_loss = policy_loss + config.vf_coef * value_loss - ent_coef * entropy
 
             return total_loss, {
                 "policy_loss": policy_loss,
@@ -371,13 +368,15 @@ def make_ppo_update(network: ActorCritic, config: PPOConfig) -> Callable:
     @jax.jit
     def ppo_update(
         train_state: TrainState,
-        transitions: Transition,  # (B,) flat batch
-        advantages: chex.Array,  # (B,) pre-computed per-env GAE
-        returns: chex.Array,  # (B,) pre-computed per-env returns
+        transitions: Transition,
+        advantages: chex.Array,
+        returns: chex.Array,
         key: chex.PRNGKey,
+        ent_coef: float = None,
     ) -> Tuple[TrainState, dict]:
         B = transitions.obs.shape[0]
         minibatch_size = B // config.n_minibatches
+        current_ent_coef = ent_coef if ent_coef is not None else config.ent_coef
 
         def _epoch(carry, _):
             ts, key = carry
@@ -389,10 +388,10 @@ def make_ppo_update(network: ActorCritic, config: PPOConfig) -> Callable:
                 mb = jax.tree.map(lambda x: x[idx], transitions)
                 mb_adv = advantages[idx]
                 mb_ret = returns[idx]
-                ts, metrics = _single_update(ts, mb, mb_adv, mb_ret)
+                ts, metrics = _single_update(ts, mb, mb_adv, mb_ret, current_ent_coef)
                 return ts, metrics
 
-            starts = jnp.arange(0, B, minibatch_size)  # (n_minibatches,)
+            starts = jnp.arange(0, B, minibatch_size)
             ts, metrics = lax.scan(_minibatch, ts, starts)
             return (ts, key), metrics
 
@@ -400,7 +399,6 @@ def make_ppo_update(network: ActorCritic, config: PPOConfig) -> Callable:
             _epoch, (train_state, key), None, length=config.n_epochs
         )
 
-        # average metrics over epochs and minibatches
         metrics = jax.tree.map(lambda x: x.mean(), all_metrics)
         return train_state, metrics
 

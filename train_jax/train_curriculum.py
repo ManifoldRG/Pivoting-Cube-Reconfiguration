@@ -11,7 +11,7 @@ curriculum learning.  Each stage:
   5. Concatenates all transitions and runs a batched PPO update.
   6. Tracks a rolling success rate (last ROLLING_WINDOW episodes).
   7. Advances to the next stage once the rolling success rate
-     exceeds the stage target (or max_episodes is reached).
+     exceeds the stage target, plateaus, or max_episodes is reached.
 
 Key fixes vs previous version:
   - Step budget: max_steps = phases * n (matches PyTorch semantics)
@@ -68,119 +68,142 @@ from train_jax.ppo_jax import (
 
 ROLLING_WINDOW_SIZE = 100
 DEFAULT_ADVANCE_THRESHOLD = 0.85
+DEFAULT_PLATEAU_MIN_DELTA = 0.005
 
 # Step budgets now use: phases_per_agent * n = total individual agent actions
 # This matches PyTorch where max_steps = phases, and OGMEnv gets phases * n.
 CURRICULUM_STAGES: List[Dict] = [
-    # Stage 0: n=4  (150 phases/agent => 600 phases => 2400 individual steps)
+    # Stage 0: n=4
     {
         "n": 4,
-        "phases_per_episode": 600,  # phases (all-agents-act-once)
-        "min_episodes": 500,
-        "max_episodes": 2000,
+        "phases_per_episode": 600,
+        "min_episodes": 400,
+        "max_episodes": 1800,
         "target_rolling_success": 0.90,
         "lr": 5e-4,
         "entropy": 0.03,
+        "plateau_patience": 300,
     },
-    # Stage 1: n=5  (150 phases/agent => 750 phases => 3750 individual steps)
+    # Stage 1: n=5
     {
         "n": 5,
-        "phases_per_episode": 750,
-        "min_episodes": 500,
-        "max_episodes": 2500,
-        "target_rolling_success": 0.88,
+        "phases_per_episode": 800,
+        "min_episodes": 450,
+        "max_episodes": 2200,
+        "target_rolling_success": 0.86,
         "lr": 4.5e-4,
         "entropy": 0.03,
+        "plateau_patience": 350,
     },
     # Stage 2: n=6
     {
         "n": 6,
-        "phases_per_episode": 900,
-        "min_episodes": 600,
-        "max_episodes": 2500,
-        "target_rolling_success": 0.85,
+        "phases_per_episode": 950,
+        "min_episodes": 550,
+        "max_episodes": 2600,
+        "target_rolling_success": 0.82,
         "lr": 4e-4,
         "entropy": 0.03,
+        "plateau_patience": 400,
     },
     # Stage 3: n=7
     {
         "n": 7,
-        "phases_per_episode": 1050,
+        "phases_per_episode": 1100,
         "min_episodes": 600,
         "max_episodes": 3000,
-        "target_rolling_success": 0.80,
+        "target_rolling_success": 0.78,
         "lr": 3.5e-4,
         "entropy": 0.03,
+        "plateau_patience": 450,
     },
-    # Stage 4: n=8 (CRITICAL - 175 phases/agent => 1400 phases => 11200 steps)
+    # Stage 4: n=8
     {
         "n": 8,
-        "phases_per_episode": 1400,
-        "min_episodes": 1000,
-        "max_episodes": 6000,
-        "target_rolling_success": 0.75,
-        "lr": 3e-4,
-        "entropy": 0.035,
-    },
-    # Stage 5: n=10
-    {
-        "n": 10,
-        "phases_per_episode": 1800,
-        "min_episodes": 1200,
-        "max_episodes": 6000,
-        "target_rolling_success": 0.75,
+        "phases_per_episode": 1600,
+        "min_episodes": 700,
+        "max_episodes": 4200,
+        "target_rolling_success": 0.58,
         "lr": 2.5e-4,
         "entropy": 0.03,
+        "plateau_patience": 600,
     },
-    # Stage 6: n=12
+    # Stage 5: n=9
+    {
+        "n": 9,
+        "phases_per_episode": 1900,
+        "min_episodes": 800,
+        "max_episodes": 4600,
+        "target_rolling_success": 0.54,
+        "lr": 2.2e-4,
+        "entropy": 0.029,
+        "plateau_patience": 650,
+    },
+    # Stage 6: n=10
+    {
+        "n": 10,
+        "phases_per_episode": 2200,
+        "min_episodes": 900,
+        "max_episodes": 5000,
+        "target_rolling_success": 0.50,
+        "lr": 2e-4,
+        "entropy": 0.028,
+        "plateau_patience": 700,
+    },
+    # Stage 7: n=12
     {
         "n": 12,
-        "phases_per_episode": 2200,
-        "min_episodes": 1500,
-        "max_episodes": 7000,
-        "target_rolling_success": 0.70,
-        "lr": 2e-4,
+        "phases_per_episode": 2800,
+        "min_episodes": 1100,
+        "max_episodes": 6000,
+        "target_rolling_success": 0.44,
+        "lr": 1.5e-4,
         "entropy": 0.025,
+        "plateau_patience": 800,
     },
-    # Stage 7: n=15
+    # Stage 8: n=15
     {
         "n": 15,
-        "phases_per_episode": 3000,
-        "min_episodes": 2000,
-        "max_episodes": 8000,
-        "target_rolling_success": 0.65,
-        "lr": 1.5e-4,
-        "entropy": 0.02,
+        "phases_per_episode": 3800,
+        "min_episodes": 1400,
+        "max_episodes": 7500,
+        "target_rolling_success": 0.38,
+        "lr": 1.2e-4,
+        "entropy": 0.022,
+        "plateau_patience": 1000,
     },
-    # Stage 8: n=20
+    # Stage 9: n=20
     {
         "n": 20,
         "phases_per_episode": 4000,
-        "min_episodes": 3000,
-        "max_episodes": 10000,
-        "target_rolling_success": 0.60,
+        "min_episodes": 1800,
+        "max_episodes": 9000,
+        "target_rolling_success": 0.34,
         "lr": 1e-4,
         "entropy": 0.015,
+        "plateau_patience": 1300,
     },
-    # Stage 9: n=30
+    # Stage 10: n=30
     {
         "n": 30,
         "phases_per_episode": 6000,
-        "min_episodes": 4000,
+        "min_episodes": 2500,
         "max_episodes": 12000,
-        "target_rolling_success": 0.55,
-        "lr": 8e-5,
+        "target_rolling_success": 0.28,
+        "lr": 7e-5,
         "entropy": 0.01,
+        "plateau_patience": 1600,
     },
-    # Stage 10: n=50
+    # Stage 11: n=50
     {
         "n": 50,
         "phases_per_episode": 10000,
-        "min_episodes": 5000,
+        "min_episodes": 3000,
         "max_episodes": 15000,
-        "target_rolling_success": 0.50,
+        "target_rolling_success": 0.22,
         "lr": 5e-5,
         "entropy": 0.008,
+        "plateau_patience": 2200,
     },
 ]
 
@@ -190,7 +213,59 @@ CURRICULUM_STAGES: List[Dict] = [
 # ============================================
 
 
-def make_env(stage: Dict, local_k: Optional[int] = None, reward_kwargs: Optional[Dict] = None) -> VectorizedOGMEnv:
+def _warmup_normalizer(
+    env: VectorizedOGMEnv,
+    norm_state: NormalizerState,
+    n_envs: int,
+    n_samples: int = 1000,
+    key: jax.Array = None,
+) -> NormalizerState:
+    if key is None:
+        key = jax.random.PRNGKey(42)
+
+    @jax.jit
+    def _collect_samples(carry, _):
+        norm_state, env_states, obs_batch, key = carry
+        action_masks = jax.vmap(env.get_action_mask)(env_states)
+        logits = jnp.where(
+            action_masks, jnp.zeros_like(action_masks, dtype=jnp.float32), -1e9
+        )
+        action_keys = jax.random.split(key, n_envs)
+        actions = jax.vmap(lambda lg, k: jax.random.categorical(k, lg))(
+            logits, action_keys
+        )
+        next_obs, next_states, _, dones = jax.vmap(env.step)(env_states, actions)
+
+        reset_keys = jax.random.split(key, n_envs + 1)
+        key = reset_keys[0]
+        reset_obs, reset_states = jax.vmap(env.reset)(reset_keys[1:])
+        next_obs = jnp.where(dones[:, None], reset_obs, next_obs)
+        next_states = jax.tree.map(
+            lambda r, n: jnp.where(dones.reshape((-1,) + (1,) * (r.ndim - 1)), r, n),
+            reset_states,
+            next_states,
+        )
+
+        norm_state = update_normalizer(norm_state, next_obs)
+        return (norm_state, next_states, next_obs, key), None
+
+    init_keys = jax.random.split(key, n_envs + 1)
+    key = init_keys[0]
+    env_keys = init_keys[1:]
+    obs_batch, env_states = jax.vmap(env.reset)(env_keys)
+
+    (norm_state, _, _, key), _ = lax.scan(
+        _collect_samples,
+        (norm_state, env_states, obs_batch, key),
+        None,
+        length=n_samples,
+    )
+    return norm_state
+
+
+def make_env(
+    stage: Dict, local_k: Optional[int] = None, reward_kwargs: Optional[Dict] = None
+) -> VectorizedOGMEnv:
     """Create OGM environment for the given curriculum stage.
 
     Step budget fix (D12): max_steps = phases_per_episode * n
@@ -223,11 +298,14 @@ def make_env(stage: Dict, local_k: Optional[int] = None, reward_kwargs: Optional
         use_exponential_step_cost=rk.get("use_exponential_step_cost", False),
         step_cost_initial=rk.get("step_cost_initial", -0.01),
         step_cost_min=rk.get("step_cost_min", -0.001),
+        enable_local_reward=rk.get("enable_local_reward", True),
+        local_reward_scale=rk.get("local_reward_scale", 0.5),
     )
     return VectorizedOGMEnv(config)
 
 
 def make_ppo_config(stage: Dict) -> PPOConfig:
+    n_steps = max(256, min(1024, stage["phases_per_episode"] // 4))
     return PPOConfig(
         learning_rate=stage["lr"],
         gamma=0.99,
@@ -236,7 +314,7 @@ def make_ppo_config(stage: Dict) -> PPOConfig:
         vf_coef=0.5,
         ent_coef=stage["entropy"],
         max_grad_norm=0.5,
-        n_steps=256,
+        n_steps=n_steps,
         n_minibatches=8,
         n_epochs=4,
         anneal_lr=False,
@@ -349,6 +427,7 @@ def train_stage(
     key: Optional[jax.Array] = None,
     verbose: bool = True,
     rolling_window: int = ROLLING_WINDOW_SIZE,
+    plateau_min_delta: float = DEFAULT_PLATEAU_MIN_DELTA,
     reward_kwargs: Optional[Dict] = None,
     writer: Optional[SummaryWriter] = None,
     global_step_offset: int = 0,
@@ -371,6 +450,7 @@ def train_stage(
     os.makedirs(stage_dir, exist_ok=True)
 
     target_rolling = stage.get("target_rolling_success", DEFAULT_ADVANCE_THRESHOLD)
+    plateau_patience = int(stage.get("plateau_patience", 0))
 
     if verbose:
         print(f"\n{'=' * 60}", flush=True)
@@ -379,6 +459,12 @@ def train_stage(
             f"  Target rolling success (window={rolling_window}): {target_rolling * 100:.0f}%",
             flush=True,
         )
+        if plateau_patience > 0:
+            print(
+                f"  Plateau stop: no rolling improvement >= {plateau_min_delta * 100:.2f}% "
+                f"for {plateau_patience} episodes",
+                flush=True,
+            )
         print(f"  LR={stage['lr']:.2e}  ent={stage['entropy']}", flush=True)
         print(
             f"  max_steps={max_steps_total} ({stage['phases_per_episode']} phases x {n} agents)",
@@ -400,9 +486,13 @@ def train_stage(
 
     # --- initialise observation normalizer ---
     if prev_norm_state is not None:
-        norm_state = prev_norm_state
         if verbose:
-            print("  Loaded normalizer state from previous stage", flush=True)
+            print("  Warming up normalizer at new n...", flush=True)
+        norm_state = _warmup_normalizer(
+            env, prev_norm_state, n_envs, n_samples=1000, key=key
+        )
+        if verbose:
+            print("  Normalizer warmed up at new n", flush=True)
     else:
         norm_state = init_normalizer(env.obs_dim)
 
@@ -426,6 +516,8 @@ def train_stage(
     success_this_update = 0
     start_time = time.time()
     best_rolling = 0.0
+    best_rolling_episode = 0
+    stop_reason = "max_updates"
 
     steps_per_update = ppo_config.n_steps * n_envs
     total_budget = stage["max_episodes"] * max_steps_total
@@ -434,6 +526,10 @@ def train_stage(
 
     # --- main loop ---
     for update_idx in range(n_updates):
+        initial_ent = stage["entropy"]
+        decay_progress = jnp.float32(update_idx) / jnp.float32(max(n_updates, 1))
+        current_ent = initial_ent * (1.0 - 0.5 * decay_progress)
+        current_ent = float(current_ent)
         # ---- collect n_steps of experience ----
         transitions_list = []
         all_dones_list = []
@@ -509,15 +605,24 @@ def train_stage(
         # ---- PPO update ----
         key, update_key = jax.random.split(key)
         train_state, metrics = ppo_update(
-            train_state, transitions_flat, advantages, returns, update_key
+            train_state, transitions_flat, advantages, returns, update_key, current_ent
         )
 
         # ---- compute rolling success ----
         window_len = len(episode_outcomes)
         win_success = sum(episode_outcomes)
         rolling_success = win_success / max(window_len, 1)
-        if episode_count >= stage["min_episodes"]:
-            best_rolling = max(best_rolling, rolling_success)
+        if episode_count >= stage["min_episodes"] and window_len >= rolling_window:
+            if best_rolling_episode == 0:
+                best_rolling = rolling_success
+                best_rolling_episode = episode_count
+            elif rolling_success >= (best_rolling + plateau_min_delta):
+                best_rolling = rolling_success
+                best_rolling_episode = episode_count
+
+        episodes_since_best = (
+            episode_count - best_rolling_episode if best_rolling_episode > 0 else 0
+        )
 
         # ---- logging ----
         if verbose and (update_idx % 5 == 0 or ep_this_update > 0):
@@ -539,6 +644,9 @@ def train_stage(
                 f"  upd {update_idx:5d} | "
                 f"ep {episode_count:6d} (+{ep_this_update:3d}, {success_this_update}/{ep_this_update} ok) | "
                 f"win [{win_success:3d}/{window_len:3d}]=[{bar}] {rolling_success * 100:5.1f}% | "
+                f"criterion: rolling(last_{rolling_window})>={target_rolling * 100:4.1f}% | "
+                f"best={best_rolling * 100:5.1f}%@ep{best_rolling_episode:5d} "
+                f"since_best={episodes_since_best:4d} | "
                 f"pol={float(metrics.get('policy_loss', 0.0)):8.4f} "
                 f"val={float(metrics.get('value_loss', 0.0)):8.4f} "
                 f"ent={float(metrics.get('entropy', 0.0)):6.4f} | "
@@ -549,13 +657,37 @@ def train_stage(
         # ---- tensorboard logging ----
         if writer is not None:
             global_step += steps_per_update
-            writer.add_scalar(f"stage_n{n}/rolling_success", rolling_success, global_step)
-            writer.add_scalar(f"stage_n{n}/policy_loss", float(metrics.get("policy_loss", 0.0)), global_step)
-            writer.add_scalar(f"stage_n{n}/value_loss", float(metrics.get("value_loss", 0.0)), global_step)
-            writer.add_scalar(f"stage_n{n}/entropy", float(metrics.get("entropy", 0.0)), global_step)
-            writer.add_scalar(f"stage_n{n}/reward", float(metrics.get("total_loss", 0.0)), global_step) # actually total loss, but useful
+            writer.add_scalar(
+                f"stage_n{n}/rolling_success", rolling_success, global_step
+            )
+            writer.add_scalar(
+                f"stage_n{n}/target_rolling_success", target_rolling, global_step
+            )
+            writer.add_scalar(
+                f"stage_n{n}/best_rolling_success", best_rolling, global_step
+            )
+            writer.add_scalar(
+                f"stage_n{n}/policy_loss",
+                float(metrics.get("policy_loss", 0.0)),
+                global_step,
+            )
+            writer.add_scalar(
+                f"stage_n{n}/value_loss",
+                float(metrics.get("value_loss", 0.0)),
+                global_step,
+            )
+            writer.add_scalar(
+                f"stage_n{n}/entropy", float(metrics.get("entropy", 0.0)), global_step
+            )
+            writer.add_scalar(
+                f"stage_n{n}/reward", float(metrics.get("total_loss", 0.0)), global_step
+            )  # actually total loss, but useful
             if ep_this_update > 0:
-                writer.add_scalar(f"stage_n{n}/success_rate_this_update", success_this_update / ep_this_update, global_step)
+                writer.add_scalar(
+                    f"stage_n{n}/success_rate_this_update",
+                    success_this_update / ep_this_update,
+                    global_step,
+                )
 
         # ---- early stop on target ----
         if (
@@ -569,12 +701,32 @@ def train_stage(
                     f"({win_success}/{window_len} in window) >= {target_rolling * 100:.0f}%",
                     flush=True,
                 )
+            stop_reason = "target"
+            break
+
+        # ---- plateau stop ----
+        if (
+            plateau_patience > 0
+            and episode_count >= stage["min_episodes"]
+            and window_len >= rolling_window
+            and best_rolling_episode > 0
+            and episodes_since_best >= plateau_patience
+        ):
+            if verbose:
+                print(
+                    f"\n  PLATEAU STOP: best rolling {best_rolling * 100:.1f}% "
+                    f"at episode {best_rolling_episode}; no improvement >= "
+                    f"{plateau_min_delta * 100:.2f}% for {plateau_patience} episodes",
+                    flush=True,
+                )
+            stop_reason = "plateau"
             break
 
         # ---- max episodes ----
         if episode_count >= stage["max_episodes"]:
             if verbose:
                 print(f"\n  Max episodes reached ({stage['max_episodes']})", flush=True)
+            stop_reason = "max_episodes"
             break
 
     # --- final stats ---
@@ -594,6 +746,7 @@ def train_stage(
         )
         print(f"  Best rolling success     : {best_rolling * 100:.1f}%", flush=True)
         print(f"  Target                   : {target_rolling * 100:.0f}%", flush=True)
+        print(f"  Stop reason              : {stop_reason}", flush=True)
         print(f"  Wall time                : {elapsed / 60:.1f} min", flush=True)
 
     # --- checkpoint ---
@@ -608,6 +761,9 @@ def train_stage(
                 "best_rolling_success": best_rolling,
                 "episodes": episode_count,
                 "rolling_window_size": rolling_window,
+                "plateau_min_delta": plateau_min_delta,
+                "plateau_patience": plateau_patience,
+                "stop_reason": stop_reason,
             },
             f,
         )
@@ -633,6 +789,8 @@ def run_curriculum(
     verbose: bool = True,
     reward_kwargs: Optional[Dict] = None,
     use_tensorboard: bool = True,
+    rolling_window: int = ROLLING_WINDOW_SIZE,
+    plateau_min_delta: float = DEFAULT_PLATEAU_MIN_DELTA,
 ):
     if log_dir is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -647,6 +805,8 @@ def run_curriculum(
         print(f"  Stages: {[s['n'] for s in stages]}")
         print(f"  Start:  stage {start_stage + 1}")
         print(f"  Envs:   {n_envs}")
+        print(f"  Rolling window: {rolling_window}")
+        print(f"  Plateau min delta: {plateau_min_delta * 100:.2f}%")
         print(f"  Log:    {log_dir}")
         print(f"  JAX devices: {jax.devices()}")
         tpu = any("tpu" in str(d).lower() for d in jax.devices())
@@ -681,6 +841,8 @@ def run_curriculum(
             n_envs=n_envs,
             key=stage_key,
             verbose=verbose,
+            rolling_window=rolling_window,
+            plateau_min_delta=plateau_min_delta,
             reward_kwargs=reward_kwargs,
             writer=writer,
             global_step_offset=global_step_offset,
@@ -722,25 +884,45 @@ def main():
     parser.add_argument("--log_dir", type=str, default=None)
     parser.add_argument("--local_k", type=int, default=7)
     parser.add_argument("--n_envs", type=int, default=256)
+    parser.add_argument("--rolling_window", type=int, default=ROLLING_WINDOW_SIZE)
+    parser.add_argument(
+        "--plateau_min_delta",
+        type=float,
+        default=DEFAULT_PLATEAU_MIN_DELTA,
+        help="Minimum rolling-success improvement to reset plateau patience",
+    )
     parser.add_argument("--load_checkpoint", type=str, default=None)
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--no_tensorboard", action="store_true",
-                        help="Disable TensorBoard logging")
+    parser.add_argument(
+        "--no_tensorboard", action="store_true", help="Disable TensorBoard logging"
+    )
     # Reward configuration
-    parser.add_argument("--enable_soft_matching", action="store_true",
-                        help="Enable soft matching reward")
+    parser.add_argument(
+        "--enable_soft_matching",
+        action="store_true",
+        help="Enable soft matching reward",
+    )
     parser.add_argument("--soft_matching_scale", type=float, default=100.0)
     parser.add_argument("--soft_matching_decay_beta", type=float, default=0.999)
-    parser.add_argument("--enable_potential", action="store_true", default=True,
-                        help="Enable potential-based shaping (default: on)")
-    parser.add_argument("--no_potential", action="store_true",
-                        help="Disable potential-based shaping")
+    parser.add_argument(
+        "--enable_potential",
+        action="store_true",
+        default=True,
+        help="Enable potential-based shaping (default: on)",
+    )
+    parser.add_argument(
+        "--no_potential", action="store_true", help="Disable potential-based shaping"
+    )
     parser.add_argument("--potential_scale", type=float, default=1.0)
     parser.add_argument("--success_bonus", type=float, default=100.0)
     parser.add_argument("--step_cost", type=float, default=-0.005)
     parser.add_argument("--use_exponential_step_cost", action="store_true")
     parser.add_argument("--step_cost_initial", type=float, default=-0.01)
     parser.add_argument("--step_cost_min", type=float, default=-0.001)
+    parser.add_argument(
+        "--no_local_reward", action="store_true", help="Disable local reward"
+    )
+    parser.add_argument("--local_reward_scale", type=float, default=0.5)
 
     args = parser.parse_args()
 
@@ -756,6 +938,8 @@ def main():
         "use_exponential_step_cost": args.use_exponential_step_cost,
         "step_cost_initial": args.step_cost_initial,
         "step_cost_min": args.step_cost_min,
+        "enable_local_reward": not args.no_local_reward,
+        "local_reward_scale": args.local_reward_scale,
     }
 
     run_curriculum(
@@ -768,6 +952,8 @@ def main():
         verbose=not args.quiet,
         reward_kwargs=reward_kwargs,
         use_tensorboard=not args.no_tensorboard,
+        rolling_window=args.rolling_window,
+        plateau_min_delta=args.plateau_min_delta,
     )
 
 

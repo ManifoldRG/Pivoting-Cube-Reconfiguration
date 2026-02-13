@@ -75,6 +75,8 @@ class CustomCallback(BaseCallback):
         target_success_rate=None,  # Target success rate to trigger early stop (0.0-1.0)
         min_episodes=None,  # Minimum episodes before early stopping allowed
         window_size=100,  # Window size for computing rolling success rate
+        plateau_patience=0,  # Stop if rolling success does not improve for N episodes
+        plateau_min_delta=0.005,  # Minimum rolling-success improvement to reset plateau
         # Checkpoint parameters
         checkpoint_interval=0,  # Save checkpoint every N episodes (0 disables)
         # Environment kwargs for GIF generation
@@ -92,14 +94,25 @@ class CustomCallback(BaseCallback):
         self.target_success_rate = target_success_rate
         self.min_episodes = min_episodes
         self.window_size = window_size
+        self.plateau_patience = max(0, int(plateau_patience or 0))
+        self.plateau_min_delta = float(plateau_min_delta)
         self.recent_successes = []  # Rolling window of success/failure
         self.early_stop_triggered = False
+        self.plateau_stop_triggered = False
+        self.best_rolling_rate = 0.0
+        self.best_rolling_rate_episode = 0
         # Checkpointing
         self.checkpoint_interval = checkpoint_interval
         self.last_checkpoint_episode = 0
         # GIF generation
         self.last_gif_episode = 0
         self.env_kwargs = env_kwargs or {}
+
+    def _rolling_success_rate(self):
+        """Return rolling success rate over the configured window, or None."""
+        if len(self.recent_successes) < self.window_size:
+            return None
+        return sum(self.recent_successes) / len(self.recent_successes)
 
     def _on_step(self) -> bool:
         """Called after each environment step. Handles multiple parallel environments."""
@@ -148,26 +161,34 @@ class CustomCallback(BaseCallback):
             if (
                 self.episode_count % 10 == 0 or actual_success
             ):  # Log every 10th or successes
+                rolling_rate = self._rolling_success_rate()
+                if rolling_rate is None:
+                    rolling_str = f"rolling: warming_up({len(self.recent_successes)}/{self.window_size})"
+                else:
+                    rolling_str = f"rolling: {100.0 * rolling_rate:.1f}%"
+
                 if phi_current is not None:
                     logging.info(
-                        "Episode %d [env%d] after %d steps -- reward: %.3f : success = %s | φ: %.4f/%.4f | truncated: %s",
+                        "Episode %d [env%d] after %d steps -- reward: %.3f : success = %s | %s | φ: %.4f/%.4f | truncated: %s",
                         self.episode_count,
                         env_idx,
                         episode_step,
                         reward,
                         actual_success,
+                        rolling_str,
                         phi_current,
                         phi_max,
                         truncated_by_steps,
                     )
                 else:
                     logging.info(
-                        "Episode %d [env%d] after %d steps -- reward: %.3f : success = %s",
+                        "Episode %d [env%d] after %d steps -- reward: %.3f : success = %s | %s",
                         self.episode_count,
                         env_idx,
                         episode_step,
                         reward,
                         actual_success,
+                        rolling_str,
                     )
 
             # Log to tensorboard
@@ -179,22 +200,41 @@ class CustomCallback(BaseCallback):
                     "custom/avg_episode_length", np.mean(self.episode_steps[-100:])
                 )
                 # Log rolling success rate
-                if len(self.recent_successes) >= self.window_size:
-                    rolling_rate = sum(self.recent_successes) / len(
-                        self.recent_successes
-                    )
+                rolling_rate = self._rolling_success_rate()
+                if rolling_rate is not None:
                     self.logger.record("custom/rolling_success_rate", rolling_rate)
+                    if rolling_rate >= (
+                        self.best_rolling_rate + self.plateau_min_delta
+                    ):
+                        self.best_rolling_rate = rolling_rate
+                        self.best_rolling_rate_episode = self.episode_count
 
             # Check for early stopping (curriculum advancement)
             if self._should_early_stop():
+                rolling_rate = self._rolling_success_rate()
                 logging.info(
-                    "🎯 TARGET REACHED! Rolling success rate %.1f%% >= %.1f%% after %d episodes",
-                    100.0 * sum(self.recent_successes) / len(self.recent_successes),
+                    "🎯 TARGET REACHED! rolling_success_rate(last_%d)=%.1f%% >= %.1f%% after %d episodes",
+                    self.window_size,
+                    100.0 * rolling_rate if rolling_rate is not None else 0.0,
                     100.0 * self.target_success_rate,
                     self.episode_count,
                 )
                 self.early_stop_triggered = True
                 return False  # Stop training
+
+            # Check for plateau-based stop (avoid spending thousands of episodes
+            # when a stage stalls and should hand off to the next curriculum stage).
+            if self._should_plateau_stop():
+                logging.info(
+                    "⏭️ PLATEAU STOP: best rolling success %.1f%% at episode %d, "
+                    "no improvement >= %.2f%% for %d episodes",
+                    100.0 * self.best_rolling_rate,
+                    self.best_rolling_rate_episode,
+                    100.0 * self.plateau_min_delta,
+                    self.plateau_patience,
+                )
+                self.plateau_stop_triggered = True
+                return False
 
             # Save checkpoint periodically
             if self._should_save_checkpoint():
@@ -216,12 +256,25 @@ class CustomCallback(BaseCallback):
             return False
 
         # Need full window of data
-        if len(self.recent_successes) < self.window_size:
+        rolling_rate = self._rolling_success_rate()
+        if rolling_rate is None:
             return False
 
         # Check rolling success rate
-        rolling_rate = sum(self.recent_successes) / len(self.recent_successes)
         return rolling_rate >= self.target_success_rate
+
+    def _should_plateau_stop(self) -> bool:
+        """Check if rolling success has plateaued for too long."""
+        if self.plateau_patience <= 0:
+            return False
+        if self.min_episodes and self.episode_count < self.min_episodes:
+            return False
+        if self._rolling_success_rate() is None:
+            return False
+        if self.best_rolling_rate_episode <= 0:
+            return False
+        episodes_since_improvement = self.episode_count - self.best_rolling_rate_episode
+        return episodes_since_improvement >= self.plateau_patience
 
     def _should_save_checkpoint(self) -> bool:
         """Check if we should save a checkpoint based on episode count."""
@@ -240,8 +293,8 @@ class CustomCallback(BaseCallback):
         os.makedirs(checkpoint_dir, exist_ok=True)
 
         # Get rolling success rate for filename
-        if len(self.recent_successes) >= self.window_size:
-            rolling_rate = sum(self.recent_successes) / len(self.recent_successes)
+        rolling_rate = self._rolling_success_rate()
+        if rolling_rate is not None:
             rate_str = f"_sr{rolling_rate:.2f}"
         else:
             rate_str = ""
@@ -368,12 +421,26 @@ class CustomCallback(BaseCallback):
         """Called at the end of each rollout (after collecting experience)."""
         if self.episode_count > 0:
             success_rate = 100.0 * self.success_count / self.episode_count
+            rolling_rate = self._rolling_success_rate()
+            if rolling_rate is None:
+                rolling_str = (
+                    f"warming_up({len(self.recent_successes)}/{self.window_size})"
+                )
+            else:
+                rolling_str = f"{100.0 * rolling_rate:.2f}%"
+
+            criteria_str = "rolling_success_rate(last_%d)" % self.window_size
+            if self.target_success_rate is not None:
+                criteria_str += " target=%.2f%%" % (100.0 * self.target_success_rate)
+
             logging.info(
-                "Progress: %d episodes completed | Success rate: %.2f%% (%d/%d)",
+                "Progress: %d episodes | Success rate: %.2f%% (%d/%d) | Rolling success: %s | Criterion: %s",
                 self.episode_count,
                 success_rate,
                 self.success_count,
                 self.episode_count,
+                rolling_str,
+                criteria_str,
             )
 
 
@@ -590,6 +657,8 @@ def train(args):
         target_success_rate=args.target_success_rate,
         min_episodes=args.min_episodes,
         window_size=args.success_window_size,
+        plateau_patience=args.plateau_patience,
+        plateau_min_delta=args.plateau_min_delta,
         # Checkpointing
         checkpoint_interval=args.checkpoint_interval,
         # Environment kwargs for GIF generation
@@ -599,13 +668,22 @@ def train(args):
     # Log early stopping configuration
     if args.target_success_rate is not None:
         logging.info(
-            "Early stopping enabled: target_success_rate=%.1f%%, min_episodes=%s, window_size=%d",
+            "Early stopping enabled: rolling_success_rate(last_%d) >= %.1f%%, min_episodes=%s",
+            args.success_window_size,
             args.target_success_rate * 100,
             args.min_episodes,
-            args.success_window_size,
         )
     else:
         logging.info("Early stopping disabled (no target_success_rate set)")
+
+    if args.plateau_patience > 0:
+        logging.info(
+            "Plateau stop enabled: patience=%d episodes, min_delta=%.2f%%",
+            args.plateau_patience,
+            100.0 * args.plateau_min_delta,
+        )
+    else:
+        logging.info("Plateau stop disabled")
 
     if args.checkpoint_interval > 0:
         logging.info("Checkpointing enabled: saving every %d episodes", args.checkpoint_interval)
@@ -906,6 +984,18 @@ if __name__ == "__main__":
         type=int,
         default=100,
         help="Window size for computing rolling success rate (default: 100)",
+    )
+    parser.add_argument(
+        "--plateau_patience",
+        type=int,
+        default=0,
+        help="Stop stage if rolling success does not improve for N episodes (0 disables)",
+    )
+    parser.add_argument(
+        "--plateau_min_delta",
+        type=float,
+        default=0.005,
+        help="Minimum rolling-success improvement considered progress for plateau stop",
     )
 
     # Checkpointing

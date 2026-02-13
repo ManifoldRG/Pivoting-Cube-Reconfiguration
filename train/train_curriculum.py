@@ -2,10 +2,10 @@
 Curriculum learning for scaling unlabeled cube reconfiguration to n=50.
 
 This script implements an automated curriculum training pipeline that:
-1. Trains progressively on larger n values (8 → 12 → 18 → 25 → 35 → 50)
+1. Trains progressively on larger n values (4 → 5 → 6 → 7 → 8 → 10 → 12 → 15 ...)
 2. Uses four-band + local neighborhood reduction for constant observation size
 3. Transfers model weights between stages for efficient learning
-4. Auto-advances when success rate exceeds threshold
+4. Auto-advances when success reaches target or plateaus
 
 Usage:
     # Train full curriculum to n=50
@@ -28,88 +28,97 @@ from datetime import datetime
 # Curriculum stages: progressively increase n with appropriate hyperparameters
 # Each stage fine-tunes from the previous one
 #
-# Design principles (v2 - improved based on training observations):
-# 1. Smooth progression: n=4→5→6→7→8→10→12→15 (added intermediate stages)
-# 2. More steps per agent: ~150-200 instead of ~120-125
-# 3. Higher entropy for larger n: prevents getting stuck in local optima
-# 4. Realistic target success rates: gradual decrease as n increases
+# Design principles (v3 - tuned for reliable progression to n=15):
+# 1. Smooth progression with small jumps: n=4→5→6→7→8→10→12→15
+# 2. Realistic stage targets from observed runs (n=8 is typically ~55-60%)
+# 3. Plateau stops to avoid spending thousands of episodes on stalled stages
+# 4. More generous max_steps at larger n to reduce hard truncation bias
 #
 CURRICULUM_STAGES = [
     # ========== Small-scale stages (n=4 to n=7) ==========
     # These build foundational skills with smooth progression
     {
         "n": 4,
-        "min_episodes": 500,
-        "max_episodes": 2000,
+        "min_episodes": 400,
+        "max_episodes": 1800,
         "target_success": 0.90,
         "lr": 5e-4,
         "entropy": 0.03,
         "max_steps": 600,  # 150 steps per agent
+        "plateau_patience": 300,
     },
     {
         "n": 5,
-        "min_episodes": 500,
-        "max_episodes": 2500,
-        "target_success": 0.88,
+        "min_episodes": 450,
+        "max_episodes": 2200,
+        "target_success": 0.86,
         "lr": 4.5e-4,
         "entropy": 0.03,
-        "max_steps": 750,  # 150 steps per agent
+        "max_steps": 800,  # 160 steps per agent
+        "plateau_patience": 350,
     },
     {
         "n": 6,
-        "min_episodes": 600,
-        "max_episodes": 2500,
-        "target_success": 0.85,
+        "min_episodes": 550,
+        "max_episodes": 2600,
+        "target_success": 0.82,
         "lr": 4e-4,
         "entropy": 0.03,
-        "max_steps": 900,  # 150 steps per agent
+        "max_steps": 950,  # ~158 steps per agent
+        "plateau_patience": 400,
     },
     {
         "n": 7,
         "min_episodes": 600,
         "max_episodes": 3000,
-        "target_success": 0.80,
+        "target_success": 0.78,
         "lr": 3.5e-4,
         "entropy": 0.03,
-        "max_steps": 1050,  # 150 steps per agent
+        "max_steps": 1100,  # ~157 steps per agent
+        "plateau_patience": 450,
     },
     # ========== Medium-scale stages (n=8 to n=15) ==========
-    # Higher entropy to encourage exploration in larger state space
+    # Targets are intentionally lower than small-n stages to avoid
+    # stalling the curriculum at n=8.
     {
         "n": 8,
-        "min_episodes": 750,
-        "max_episodes": 4000,
-        "target_success": 0.75,
-        "lr": 3e-4,
-        "entropy": 0.035,  # Increased entropy for better exploration
-        "max_steps": 1400,  # 175 steps per agent
+        "min_episodes": 700,
+        "max_episodes": 4200,
+        "target_success": 0.58,
+        "lr": 2.5e-4,
+        "entropy": 0.03,
+        "max_steps": 1600,  # 200 steps per agent
+        "plateau_patience": 600,
     },
     {
         "n": 10,
-        "min_episodes": 800,
-        "max_episodes": 4500,
-        "target_success": 0.70,
-        "lr": 2.5e-4,
-        "entropy": 0.03,
-        "max_steps": 1800,  # 180 steps per agent
+        "min_episodes": 900,
+        "max_episodes": 5000,
+        "target_success": 0.50,
+        "lr": 2e-4,
+        "entropy": 0.028,
+        "max_steps": 2200,  # 220 steps per agent
+        "plateau_patience": 700,
     },
     {
         "n": 12,
-        "min_episodes": 1000,
-        "max_episodes": 5000,
-        "target_success": 0.65,
-        "lr": 2e-4,
+        "min_episodes": 1100,
+        "max_episodes": 6000,
+        "target_success": 0.44,
+        "lr": 1.5e-4,
         "entropy": 0.025,
-        "max_steps": 2200,  # ~183 steps per agent
+        "max_steps": 2800,  # ~233 steps per agent
+        "plateau_patience": 800,
     },
     {
         "n": 15,
-        "min_episodes": 1200,
-        "max_episodes": 6000,
-        "target_success": 0.60,
-        "lr": 1.5e-4,
-        "entropy": 0.02,
-        "max_steps": 3000,  # 200 steps per agent
+        "min_episodes": 1400,
+        "max_episodes": 7500,
+        "target_success": 0.38,
+        "lr": 1.2e-4,
+        "entropy": 0.022,
+        "max_steps": 3800,  # ~253 steps per agent
+        "plateau_patience": 1000,
     },
     # ========== Large-scale stages (n=18 to n=50) ==========
     # For future scaling beyond n=15
@@ -117,37 +126,41 @@ CURRICULUM_STAGES = [
         "n": 18,
         "min_episodes": 1500,
         "max_episodes": 6000,
-        "target_success": 0.55,
-        "lr": 1.2e-4,
+        "target_success": 0.34,
+        "lr": 1e-4,
         "entropy": 0.02,
         "max_steps": 3600,  # 200 steps per agent
+        "plateau_patience": 1200,
     },
     {
         "n": 25,
         "min_episodes": 2000,
         "max_episodes": 8000,
-        "target_success": 0.50,
-        "lr": 1e-4,
+        "target_success": 0.30,
+        "lr": 8e-5,
         "entropy": 0.015,
         "max_steps": 5000,  # 200 steps per agent
+        "plateau_patience": 1500,
     },
     {
         "n": 35,
         "min_episodes": 2500,
         "max_episodes": 10000,
-        "target_success": 0.45,
-        "lr": 7e-5,
+        "target_success": 0.26,
+        "lr": 6e-5,
         "entropy": 0.012,
         "max_steps": 7000,  # 200 steps per agent
+        "plateau_patience": 1800,
     },
     {
         "n": 50,
         "min_episodes": 3000,
         "max_episodes": 12000,
-        "target_success": 0.40,
-        "lr": 5e-5,
+        "target_success": 0.22,
+        "lr": 4e-5,
         "entropy": 0.01,
         "max_steps": 10000,  # 200 steps per agent
+        "plateau_patience": 2200,
     },
 ]
 
@@ -175,7 +188,13 @@ def find_latest_model(stage_dir):
 
 
 def run_training_stage(
-    stage, model_path, log_dir, local_k=7, num_envs=1, use_unlabeled=True
+    stage,
+    model_path,
+    log_dir,
+    local_k=7,
+    num_envs=1,
+    use_unlabeled=True,
+    plateau_min_delta=0.005,
 ):
     """
     Run a single curriculum stage.
@@ -187,6 +206,7 @@ def run_training_stage(
         local_k: Local neighborhood size (default 7 for n up to 50)
         num_envs: Number of parallel environments (default 1)
         use_unlabeled: Use unlabeled (label-agnostic) mode (default True)
+        plateau_min_delta: Minimum rolling-success improvement for plateau reset
 
     Returns:
         Path to saved model
@@ -230,6 +250,10 @@ def run_training_stage(
         str(stage["min_episodes"]),
         "--success_window_size",
         "100",
+        "--plateau_patience",
+        str(stage.get("plateau_patience", 0)),
+        "--plateau_min_delta",
+        str(plateau_min_delta),
         # Parallel environments for faster training
         "--num_envs",
         str(num_envs),
@@ -259,6 +283,7 @@ def run_training_stage(
     print(f"Entropy coefficient: {stage['entropy']}")
     print(f"Local neighborhood k: {local_k}")
     print(f"Parallel environments: {num_envs}")
+    print(f"Plateau patience: {stage.get('plateau_patience', 0)} episodes")
     print(f"{'=' * 70}\n")
 
     # Run training process
@@ -332,8 +357,14 @@ def main():
     parser.add_argument(
         "--num_envs",
         type=int,
-        default=1,
-        help="Number of parallel environments for faster training (default: 1, recommended: 4-8)",
+        default=0,
+        help="Parallel environments (0=auto: min(8, CPU/2), recommended for curriculum)",
+    )
+    parser.add_argument(
+        "--plateau_min_delta",
+        type=float,
+        default=0.005,
+        help="Minimum rolling-success improvement for plateau detection",
     )
     parser.add_argument(
         "--labeled",
@@ -342,6 +373,10 @@ def main():
     )
 
     args = parser.parse_args()
+    cpu_count = os.cpu_count() or 2
+    resolved_num_envs = (
+        args.num_envs if args.num_envs > 0 else max(1, min(8, cpu_count // 2))
+    )
 
     # Create timestamped log directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -367,7 +402,7 @@ def main():
     print(f"Curriculum: {' → '.join([f'n={s["n"]}' for s in stages])}")
     print(f"Log directory: {log_dir}")
     print(f"Local neighborhood k: {args.local_k}")
-    print(f"Parallel environments: {args.num_envs}")
+    print(f"Parallel environments: {resolved_num_envs}")
     print("=" * 70 + "\n")
 
     # Track model path through stages
@@ -392,8 +427,9 @@ def main():
             current_model,
             log_dir,
             args.local_k,
-            args.num_envs,
+            resolved_num_envs,
             use_unlabeled=not args.labeled,
+            plateau_min_delta=args.plateau_min_delta,
         )
 
         if model_path:

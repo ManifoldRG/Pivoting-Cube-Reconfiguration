@@ -745,10 +745,9 @@ class OGMConfig(NamedTuple):
 
     n: int
     max_steps: int
-    grid_size: int  # half-width for the dense grid used in validation
+    grid_size: int
     use_unlabeled: bool
     local_k: int
-    # Reward configuration
     enable_soft_matching: bool = False
     soft_matching_scale: float = 100.0
     soft_matching_decay_beta: float = 0.999
@@ -759,6 +758,8 @@ class OGMConfig(NamedTuple):
     use_exponential_step_cost: bool = False
     step_cost_initial: float = -0.01
     step_cost_min: float = -0.001
+    enable_local_reward: bool = True
+    local_reward_scale: float = 0.5
 
 
 # ============================================
@@ -982,8 +983,17 @@ def compute_signature_cost_matrix(
     return jnp.sum(diff * diff, axis=-1)  # (n, n)
 
 
+@jax.jit
+def compute_agent_local_dist_sum(agent_idx: int, diff_matrix: chex.Array) -> float:
+    n = diff_matrix.shape[0]
+    mask = jnp.arange(n) != agent_idx
+    return jnp.sum(jnp.abs(diff_matrix[agent_idx]) * mask)
+
+
 @partial(jax.jit, static_argnums=(1,))
-def greedy_assignment(cost_matrix: chex.Array, n: int) -> chex.Array:
+def sinkhorn_assignment(
+    cost_matrix: chex.Array, n: int, n_iters: int = 20, temp: float = 0.1
+) -> chex.Array:
     """Greedy approximation to the assignment problem (JIT-compatible).
 
     Uses iterative argmin-based assignment: for each row in order,
@@ -999,19 +1009,23 @@ def greedy_assignment(cost_matrix: chex.Array, n: int) -> chex.Array:
     Returns:
         (n,) int32 -- assignment[i] = column assigned to row i
     """
-    INF = jnp.float32(1e12)
+    log_K = -cost_matrix / temp
+    log_u = jnp.zeros(n)
+    log_v = jnp.zeros(n)
 
-    def _assign_one(carry, row_idx):
-        cost, taken = carry
-        # Mask out already-taken columns
-        masked_cost = jnp.where(taken, INF, cost[row_idx])
-        col = jnp.argmin(masked_cost)
-        taken = taken.at[col].set(True)
-        return (cost, taken), col
+    def _sinkhorn_step(carry, _):
+        log_u, log_v = carry
+        log_v = jax.scipy.special.logsumexp(log_u[:, None] + log_K, axis=0)
+        log_u = jax.scipy.special.logsumexp(log_v[None, :] + log_K, axis=1)
+        return (log_u, log_v), None
 
-    taken = jnp.zeros(n, dtype=jnp.bool_)
-    (_, _), assignments = lax.scan(_assign_one, (cost_matrix, taken), jnp.arange(n))
-    return assignments.astype(jnp.int32)  # (n,)
+    (log_u, log_v), _ = lax.scan(_sinkhorn_step, (log_u, log_v), None, length=n_iters)
+
+    log_transport = log_u[:, None] + log_K - log_v[None, :]
+    transport = jnp.exp(log_transport)
+
+    assignment = jnp.argmax(transport, axis=-1).astype(jnp.int32)
+    return assignment
 
 
 @jax.jit
@@ -1053,7 +1067,7 @@ def compute_assignment(
     curr_sigs = compute_sorted_signatures(curr_norms)
     final_sigs = compute_sorted_signatures(final_norms)
     cost = compute_signature_cost_matrix(curr_sigs, final_sigs)
-    return greedy_assignment(cost, n)
+    return sinkhorn_assignment(cost, n)
 
 
 # ============================================
@@ -1141,7 +1155,7 @@ def compute_unlabeled_soft_matching_score(
     """
     n = curr_sqdist.shape[0]
     # Sort each row (signatures); keep self-distance (0) which will be at index 0
-    curr_sigs = jnp.sort(curr_sqdist, axis=1)[:, 1:]   # (n, n-1)
+    curr_sigs = jnp.sort(curr_sqdist, axis=1)[:, 1:]  # (n, n-1)
     final_sigs = jnp.sort(final_sqdist, axis=1)[:, 1:]  # (n, n-1)
     # Align final signatures to current using assignment
     aligned_final = final_sigs[assignment]  # (n, n-1)
@@ -1157,7 +1171,7 @@ def compute_pairwise_sqdist(positions: chex.Array) -> chex.Array:
     return jnp.sum(diff * diff, axis=-1).astype(jnp.float32)  # (n, n)
 
 
-@partial(jax.jit, static_argnums=(12,))
+@partial(jax.jit, static_argnums=(13,))
 def compute_reward(
     prev_positions: chex.Array,
     curr_positions: chex.Array,
@@ -1171,6 +1185,7 @@ def compute_reward(
     phi_max: float,
     final_sqdist: chex.Array,
     step_count: int,
+    acting_agent_idx: int,
     config: OGMConfig,
 ) -> tuple:
     """Shaped reward: step_cost + potential shaping + soft matching + success + milestones.
@@ -1197,7 +1212,7 @@ def compute_reward(
     # Update assignment using current configuration
     curr_sigs = compute_sorted_signatures(curr_norms)
     cost = compute_signature_cost_matrix(curr_sigs, final_sorted_sigs)
-    new_assignment = greedy_assignment(cost, n)
+    new_assignment = sinkhorn_assignment(cost, n)
 
     # --- 1. Potential-based shaping reward ---
     prev_diff = compute_reassigned_diff(prev_norms, final_norms, prev_assignment)
@@ -1222,7 +1237,7 @@ def compute_reward(
     phi_current = jnp.where(config.use_unlabeled, phi_unlabeled, phi_labeled)
 
     # Time decay weight: w(t) = beta^t
-    w_t = config.soft_matching_decay_beta ** step_count
+    w_t = config.soft_matching_decay_beta**step_count
     # Reward = w(t) * max(0, Φ(t+1) - Φ_max(t)) * scale
     improvement = phi_current - phi_max
     soft_reward = jnp.where(
@@ -1263,6 +1278,13 @@ def compute_reward(
     milestone_bonus = jnp.where(award_50, config.success_bonus * 0.1, milestone_bonus)
     new_m50 = new_m50 | award_50
 
+    local_reward = jnp.float32(0.0)
+    if config.enable_local_reward:
+        pre_local_dist = compute_agent_local_dist_sum(acting_agent_idx, prev_diff)
+        post_local_dist = compute_agent_local_dist_sum(acting_agent_idx, curr_diff)
+        local_improvement = pre_local_dist - post_local_dist
+        local_reward = local_improvement * config.local_reward_scale
+
     # --- 5. Step cost (flat or exponential decay) ---
     # Exponential: max(initial * exp(-rate * t), min)
     # decay_rate = -ln(min / initial) / max_steps
@@ -1281,7 +1303,14 @@ def compute_reward(
     )
 
     # --- Total reward ---
-    total_reward = potential_reward + soft_reward + bonus + milestone_bonus + current_step_cost
+    total_reward = (
+        potential_reward
+        + soft_reward
+        + local_reward
+        + bonus
+        + milestone_bonus
+        + current_step_cost
+    )
     return total_reward, new_m50, new_m75, new_m90, new_assignment, new_phi_max
 
 
@@ -1364,7 +1393,7 @@ def reset(key: chex.PRNGKey, config: OGMConfig) -> OGMState:
     # Initial assignment: curr -> final via greedy signature matching
     init_sigs = compute_sorted_signatures(init_norms)
     cost = compute_signature_cost_matrix(init_sigs, final_sorted_sigs)
-    init_assignment = greedy_assignment(cost, config.n)
+    init_assignment = sinkhorn_assignment(cost, config.n)
 
     # Initial potential = Frobenius norm of reassigned diff (matches PyTorch)
     init_diff = compute_reassigned_diff(init_norms, final_norms, init_assignment)
@@ -1468,7 +1497,9 @@ def get_observation(
 
 
 @partial(jax.jit, static_argnums=(2, 3, 4))
-def step_with_action(state: OGMState, action: int, n: int, grid_size: int, config: OGMConfig = None):
+def step_with_action(
+    state: OGMState, action: int, n: int, grid_size: int, config: OGMConfig = None
+):
     """Execute action for the current agent and advance turn.
 
     Args:
@@ -1494,9 +1525,16 @@ def step_with_action(state: OGMState, action: int, n: int, grid_size: int, confi
 
     # --- reward (with all configurable reward modes) ---
     # Use default config if none provided (backward compat)
-    _config = config if config is not None else OGMConfig(
-        n=n, max_steps=1000, grid_size=grid_size,
-        use_unlabeled=True, local_k=7,
+    _config = (
+        config
+        if config is not None
+        else OGMConfig(
+            n=n,
+            max_steps=1000,
+            grid_size=grid_size,
+            use_unlabeled=True,
+            local_k=7,
+        )
     )
     reward, new_m50, new_m75, new_m90, new_assignment, new_phi_max = compute_reward(
         positions,
@@ -1511,6 +1549,7 @@ def step_with_action(state: OGMState, action: int, n: int, grid_size: int, confi
         state.phi_max,
         state.final_sqdist,
         state.step_count,
+        agent,
         _config,
     )
 
