@@ -20,7 +20,7 @@ class TestOGMPairwiseNorms(unittest.TestCase):
 
         self.assertTrue(
             ogm.check_final(),
-            msg=f"\Current pairwise norms: {ogm.curr_pairwise_norms}\Final pairwise norms:   {ogm.final_pairwise_norms}"
+            msg=f"\nCurrent pairwise norms: {ogm.curr_pairwise_norms}\nFinal pairwise norms:   {ogm.final_pairwise_norms}"
         )
 
     def assert_post_action_pairwise_norms(self, module_positions):
