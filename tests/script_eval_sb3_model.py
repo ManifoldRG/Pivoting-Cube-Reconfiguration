@@ -1,9 +1,11 @@
+import os
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
 from sb3_contrib import MaskablePPO
 from ogm.ogm_gym_env import make_ogm_env
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 import subprocess
 import logging
-import os
+import statistics
 
 #export QT_QPA_PLATFORM=offscreen
 
@@ -147,252 +149,329 @@ import os
 # 4. More generous max_steps at larger n to reduce hard truncation bias
 #
 
-def setup_logging(log_dir):
-    """Setup logging to file and console."""
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, "testing_sb3.log")
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[logging.FileHandler(log_file), logging.StreamHandler()],
-    )
-    logging.info("Logging initialized. Log directory: %s", log_dir)
+def run_tests(num_runs):
 
-CURRICULUM_STAGES = [
-    # ========== Small-scale stages (n=4 to n=7) ==========
-    # These build foundational skills with smooth progression
-    {
-        "n": 4,
-        "min_episodes": 400,
-        "max_episodes": 1800,
-        "target_success": 0.90,
-        "lr": 5e-4,
-        "entropy": 0.03,
-        "max_steps": 600,  # 150 steps per agent
-        "plateau_patience": 300,
-    },
-    {
-        "n": 5,
-        "min_episodes": 450,
-        "max_episodes": 2200,
-        "target_success": 0.86,
-        "lr": 4.5e-4,
-        "entropy": 0.03,
-        "max_steps": 800,  # 160 steps per agent
-        "plateau_patience": 350,
-    },
-    {
-        "n": 6,
-        "min_episodes": 550,
-        "max_episodes": 2600,
-        "target_success": 0.82,
-        "lr": 4e-4,
-        "entropy": 0.03,
-        "max_steps": 950,  # ~158 steps per agent
-        "plateau_patience": 400,
-    },
-    {
-        "n": 7,
-        "min_episodes": 600,
-        "max_episodes": 3000,
-        "target_success": 0.78,
-        "lr": 3.5e-4,
-        "entropy": 0.03,
-        "max_steps": 1100,  # ~157 steps per agent
-        "plateau_patience": 450,
-    },
-    # ========== Medium-scale stages (n=8 to n=15) ==========
-    # Targets are intentionally lower than small-n stages to avoid
-    # stalling the curriculum at n=8.
-    {
-        "n": 8,
-        "min_episodes": 700,
-        "max_episodes": 4200,
-        "target_success": 0.58,
-        "lr": 2.5e-4,
-        "entropy": 0.03,
-        "max_steps": 1600,  # 200 steps per agent
-        "plateau_patience": 600,
-    },
-    {
-        "n": 10,
-        "min_episodes": 900,
-        "max_episodes": 5000,
-        "target_success": 0.50,
-        "lr": 2e-4,
-        "entropy": 0.028,
-        "max_steps": 2200,  # 220 steps per agent
-        "plateau_patience": 700,
-    },
-    {
-        "n": 12,
-        "min_episodes": 1100,
-        "max_episodes": 6000,
-        "target_success": 0.44,
-        "lr": 1.5e-4,
-        "entropy": 0.025,
-        "max_steps": 2800,  # ~233 steps per agent
-        "plateau_patience": 800,
-    },
-"""     {
-        "n": 15,
-        "min_episodes": 1400,
-        "max_episodes": 7500,
-        "target_success": 0.38,
-        "lr": 1.2e-4,
-        "entropy": 0.022,
-        "max_steps": 3800,  # ~253 steps per agent
-        "plateau_patience": 1000,
-    },
-    # ========== Large-scale stages (n=18 to n=50) ==========
-    # For future scaling beyond n=15
-    {
-        "n": 18,
-        "min_episodes": 1500,
-        "max_episodes": 6000,
-        "target_success": 0.34,
-        "lr": 1e-4,
-        "entropy": 0.02,
-        "max_steps": 3600,  # 200 steps per agent
-        "plateau_patience": 1200,
-    },
-    {
-        "n": 25,
-        "min_episodes": 2000,
-        "max_episodes": 8000,
-        "target_success": 0.30,
-        "lr": 8e-5,
-        "entropy": 0.015,
-        "max_steps": 5000,  # 200 steps per agent
-        "plateau_patience": 1500,
-    },
-    {
-        "n": 35,
-        "min_episodes": 2500,
-        "max_episodes": 10000,
-        "target_success": 0.26,
-        "lr": 6e-5,
-        "entropy": 0.012,
-        "max_steps": 7000,  # 200 steps per agent
-        "plateau_patience": 1800,
-    },
-    {
-        "n": 50,
-        "min_episodes": 3000,
-        "max_episodes": 12000,
-        "target_success": 0.22,
-        "lr": 4e-5,
-        "entropy": 0.01,
-        "max_steps": 10000,  # 200 steps per agent
-        "plateau_patience": 2200,
-    }, """
-]
+    def setup_logging(log_dir):
+        """Setup logging to file and console."""
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, "testing_sb3.log")
+        logger = logging.getLogger()
 
+        # for handler in logger.handlers[:]:  # make a copy of the list
+        #     handler.stream.close()
+        #     logger.removeHandler(handler)
 
-######################## MY STUFF #####################################################
-# for loop for stages
-stage = CURRICULUM_STAGES[0]
-asdf = 10
-num_envs = 4
-#model = MaskablePPO.load("runs/sb3/final_model")
-# Parallel environments using multiprocessing
-#env = SubprocVecEnv([make_env for _ in range(num_envs)])
-model = MaskablePPO.load("/home/benjamin_faught/Pivoting-Cube-Reconfiguration/runs/curriculum_n12/to_n12_20260610_230927/stage_n4/n4_20260610_230932/final_model.zip")#,
-        #     env=env,
-        #     learning_rate=learning_rate,
-        #     n_steps=args.n_steps,
-        #     batch_size=args.batch_size,
-        #     n_epochs=args.epochs,
-        #     gamma=args.gamma,
-        #     gae_lambda=args.lam,
-        #     clip_range=args.clip,
-        #     ent_coef=args.entropy_coef,
-        #     vf_coef=args.value_coef,
-        #     max_grad_norm=args.grad_clip,
-        #     verbose=1,
-        #     tensorboard_log=args.log_dir,
-        # )
-#env = make_ogm_env(num_agents=4, max_steps=500)
-#env = make_ogm_env(num_agents=stage["n"], max_steps=stage["max_steps"], use_four_band_reduction=True, use_local_neighborhood=True, local_neighborhood_k=7, enable_potential_reward=True)
-ogm_env = make_ogm_env(
-            num_agents=stage["n"],
-            max_steps=stage["max_steps"],
-            step_cost=-0.01,
-            enable_bounty_reward=False,
-            bounty_gamma=0.999,
-            bounty_eta=2.0,
-            bounty_base_value=1.0,
-            bounty_total_frac_of_success=0.2,
-            bounty_cap_per_step=20.0,
-            enable_potential_reward=True,
-            potential_scale=1.0,
-            potential_normalize="n2",
-            success_bonus=100.0,
-            step_cost_initial=-0.01,
-            step_cost_min=-0.001,
-            use_exponential_decay=True,
-            # Soft matching reward parameters
-            enable_soft_matching_reward=False,
-            soft_matching_decay_beta=0.999,
-            soft_matching_scale=100.0,
-            # Dimension reduction parameters
-            use_four_band_reduction=True,
-            use_local_neighborhood=True,
-            local_neighborhood_k=9,
-            # Unlabeled mode
-            use_unlabeled_mode=True,
-            # Agent-specific local reward
-            enable_local_reward=False,
-            local_reward_scale=1.0,
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+            handlers=[logging.FileHandler(log_file), logging.StreamHandler()],
+            force=True
         )
+        logging.info("Logging initialized. Log directory: %s", log_dir)
 
-######################## NOT MY STUFF #####################################################
+    CURRICULUM_STAGES = [
+        # ========== Small-scale stages (n=4 to n=7) ==========
+        # These build foundational skills with smooth progression
+        {
+            "n": 4,
+            "min_episodes": 400,
+            "max_episodes": 1800,
+            "target_success": 0.90,
+            "lr": 5e-4,
+            "entropy": 0.03,
+            "max_steps": 600,  # 150 steps per agent
+            "plateau_patience": 300,
+        },
+        {
+            "n": 5,
+            "min_episodes": 450,
+            "max_episodes": 2200,
+            "target_success": 0.86,
+            "lr": 4.5e-4,
+            "entropy": 0.03,
+            "max_steps": 800,  # 160 steps per agent
+            "plateau_patience": 350,
+        },
+        {
+            "n": 6,
+            "min_episodes": 550,
+            "max_episodes": 2600,
+            "target_success": 0.82,
+            "lr": 4e-4,
+            "entropy": 0.03,
+            "max_steps": 950,  # ~158 steps per agent
+            "plateau_patience": 400,
+        },
+        {
+            "n": 7,
+            "min_episodes": 600,
+            "max_episodes": 3000,
+            "target_success": 0.78,
+            "lr": 3.5e-4,
+            "entropy": 0.03,
+            "max_steps": 1100,  # ~157 steps per agent
+            "plateau_patience": 450,
+        },
+        # ========== Medium-scale stages (n=8 to n=15) ==========
+        # Targets are intentionally lower than small-n stages to avoid
+        # stalling the curriculum at n=8.
+        {
+            "n": 8,
+            "min_episodes": 700,
+            "max_episodes": 4200,
+            "target_success": 0.58,
+            "lr": 2.5e-4,
+            "entropy": 0.03,
+            "max_steps": 1600,  # 200 steps per agent
+            "plateau_patience": 600,
+        },
+        {
+            "n": 10,
+            "min_episodes": 900,
+            "max_episodes": 5000,
+            "target_success": 0.50,
+            "lr": 2e-4,
+            "entropy": 0.028,
+            "max_steps": 2200,  # 220 steps per agent
+            "plateau_patience": 700,
+        },
+    """     {
+            "n": 12,
+            "min_episodes": 1100,
+            "max_episodes": 6000,
+            "target_success": 0.44,
+            "lr": 1.5e-4,
+            "entropy": 0.025,
+            "max_steps": 2800,  # ~233 steps per agent
+            "plateau_patience": 800,
+        }, """
+    """     {
+            "n": 15,
+            "min_episodes": 1400,
+            "max_episodes": 7500,
+            "target_success": 0.38,
+            "lr": 1.2e-4,
+            "entropy": 0.022,
+            "max_steps": 3800,  # ~253 steps per agent
+            "plateau_patience": 1000,
+        },
+        # ========== Large-scale stages (n=18 to n=50) ==========
+        # For future scaling beyond n=15
+        {
+            "n": 18,
+            "min_episodes": 1500,
+            "max_episodes": 6000,
+            "target_success": 0.34,
+            "lr": 1e-4,
+            "entropy": 0.02,
+            "max_steps": 3600,  # 200 steps per agent
+            "plateau_patience": 1200,
+        },
+        {
+            "n": 25,
+            "min_episodes": 2000,
+            "max_episodes": 8000,
+            "target_success": 0.30,
+            "lr": 8e-5,
+            "entropy": 0.015,
+            "max_steps": 5000,  # 200 steps per agent
+            "plateau_patience": 1500,
+        },
+        {
+            "n": 35,
+            "min_episodes": 2500,
+            "max_episodes": 10000,
+            "target_success": 0.26,
+            "lr": 6e-5,
+            "entropy": 0.012,
+            "max_steps": 7000,  # 200 steps per agent
+            "plateau_patience": 1800,
+        },
+        {
+            "n": 50,
+            "min_episodes": 3000,
+            "max_episodes": 12000,
+            "target_success": 0.22,
+            "lr": 4e-5,
+            "entropy": 0.01,
+            "max_steps": 10000,  # 200 steps per agent
+            "plateau_patience": 2200,
+        }, """
+    ]
 
- # Run each stage
-# for i, stage in enumerate(CURRICULUM_STAGES):
-#     # if i < args.start_stage:
-#     #     print(f"⏭️  Skipping stage {i} (n={stage['n']})")
-#     #     # Try to find model from skipped stage for next one
-#     #     stage_dir = os.path.join(log_dir, f"stage_n{stage['n']}")
-#     #     if os.path.exists(stage_dir):
-#     #         found_model = find_latest_model(stage_dir)
-#     #         if found_model:
-#     #             current_model = found_model
-#     #     continue
+    CURRICULUM_MODELS = {
+        4: "/home/benjamin_faught/Pivoting-Cube-Reconfiguration/runs/curriculum_n12/to_n12_20260610_230927/stage_n4/n4_20260610_230932/final_model.zip",
+        5: "/home/benjamin_faught/Pivoting-Cube-Reconfiguration/runs/curriculum_n12/to_n12_20260610_230927/stage_n5/n5_20260610_231110/final_model.zip",
+        6: "/home/benjamin_faught/Pivoting-Cube-Reconfiguration/runs/curriculum_n12/to_n12_20260610_230927/stage_n6/n6_20260610_231325/final_model.zip",
+        7: "/home/benjamin_faught/Pivoting-Cube-Reconfiguration/runs/curriculum_n12/to_n12_20260610_230927/stage_n7/n7_20260610_233945/final_model.zip",
+        8: "/home/benjamin_faught/Pivoting-Cube-Reconfiguration/runs/curriculum_n12/to_n12_20260610_230927/stage_n8/n8_20260611_010815/final_model.zip",
+        10: "/home/benjamin_faught/Pivoting-Cube-Reconfiguration/runs/curriculum_n12/to_n12_20260610_230927/stage_n8/n8_20260611_010815/final_model.zip"
+    }
 
-#     print(f"\n📚 Starting stage {i + 1}/{len(stages)}")
+    ######################## MY STUFF #####################################################
+    log_dir = "./test_models/"
 
-#     model_path = run_training_stage(
-#         stage,
-#         current_model,
-#         log_dir,
-#         args.local_k,
-#         resolved_num_envs,
-#         use_unlabeled=not args.labeled,
-#         plateau_min_delta=args.plateau_min_delta,
-#     )
+    # for loop for stages
+    for i in range(len(CURRICULUM_STAGES)):
+        stage = CURRICULUM_STAGES[i]
+        #num_envs = 4
+        n = stage["n"]
+        model_path = CURRICULUM_MODELS[n]
+        stage_dir = os.path.join(log_dir, f"stage_n{n}")
+        os.makedirs(stage_dir, exist_ok=True)
+        #model = MaskablePPO.load("runs/sb3/final_model")
+        # Parallel environments using multiprocessing
+        #env = SubprocVecEnv([make_env for _ in range(num_envs)])
+        #model = MaskablePPO.load("/home/benjamin_faught/Pivoting-Cube-Reconfiguration/runs/curriculum_n12/to_n12_20260610_230927/stage_n4/n4_20260610_230932/final_model.zip")#,
+        model = MaskablePPO.load(model_path)#,
+                #     env=env,
+                #     learning_rate=learning_rate,
+                #     n_steps=args.n_steps,
+                #     batch_size=args.batch_size,
+                #     n_epochs=args.epochs,
+                #     gamma=args.gamma,
+                #     gae_lambda=args.lam,
+                #     clip_range=args.clip,
+                #     ent_coef=args.entropy_coef,
+                #     vf_coef=args.value_coef,
+                #     max_grad_norm=args.grad_clip,
+                #     verbose=1,
+                #     tensorboard_log=args.log_dir,
+                # )
+        #env = make_ogm_env(num_agents=4, max_steps=500)
+        #env = make_ogm_env(num_agents=stage["n"], max_steps=stage["max_steps"], use_four_band_reduction=True, use_local_neighborhood=True, local_neighborhood_k=7, enable_potential_reward=True)
+        ogm_env = make_ogm_env(
+                    num_agents=stage["n"],
+                    max_steps=stage["max_steps"],
+                    step_cost=-0.01,
+                    enable_bounty_reward=False,
+                    bounty_gamma=0.999,
+                    bounty_eta=2.0,
+                    bounty_base_value=1.0,
+                    bounty_total_frac_of_success=0.2,
+                    bounty_cap_per_step=20.0,
+                    enable_potential_reward=True,
+                    potential_scale=1.0,
+                    potential_normalize="n2",
+                    success_bonus=100.0,
+                    step_cost_initial=-0.01,
+                    step_cost_min=-0.001,
+                    use_exponential_decay=True,
+                    # Soft matching reward parameters
+                    enable_soft_matching_reward=False,
+                    soft_matching_decay_beta=0.999,
+                    soft_matching_scale=100.0,
+                    # Dimension reduction parameters
+                    use_four_band_reduction=True,
+                    use_local_neighborhood=True,
+                    local_neighborhood_k=9,
+                    # Unlabeled mode
+                    use_unlabeled_mode=True,
+                    # Agent-specific local reward
+                    enable_local_reward=False,
+                    local_reward_scale=1.0,
+                )
 
-#     if model_path:
-#         current_model = model_path
-#         print(f"\n✅ Stage {i + 1}/{len(stages)} complete: n={stage['n']}")
-#     else:
-#         print(f"\n❌ Stage {i + 1}/{len(stages)} failed: n={stage['n']}")
-#         print("Stopping curriculum training.")
-#         break
+        ######################## NOT MY STUFF #####################################################
 
-######################## MY STUFF #####################################################
+        # Run each stage
+        # for i, stage in enumerate(CURRICULUM_STAGES):
+        #     # if i < args.start_stage:
+        #     #     print(f"⏭️  Skipping stage {i} (n={stage['n']})")
+        #     #     # Try to find model from skipped stage for next one
+        #     #     stage_dir = os.path.join(log_dir, f"stage_n{stage['n']}")
+        #     #     if os.path.exists(stage_dir):
+        #     #         found_model = find_latest_model(stage_dir)
+        #     #         if found_model:
+        #     #             current_model = found_model
+        #     #     continue
 
-setup_logging("")
-obs, info = ogm_env.reset()
-done = False
-while not done:
-    action_mask = ogm_env.action_masks()
-    action, _ = model.predict(obs, action_masks=action_mask, deterministic=True)
-    obs, reward, terminated, truncated, info = ogm_env.step(action)
-    curr_sqdist = ogm_env.env.ogm.compute_pairwise_sqdist(
-                ogm_env.env.ogm.module_positions
-            )
-    phi = ogm_env.env.compute_unlabeled_soft_matching_score(curr_sqdist, ogm_env.env.final_sqdist)
-    logging.info("reward: %s", reward)
-    logging.info("phi: %s", phi)
-    done = terminated or truncated
+        #     print(f"\n📚 Starting stage {i + 1}/{len(stages)}")
+
+        #     model_path = run_training_stage(
+        #         stage,
+        #         current_model,
+        #         log_dir,
+        #         args.local_k,
+        #         resolved_num_envs,
+        #         use_unlabeled=not args.labeled,
+        #         plateau_min_delta=args.plateau_min_delta,
+        #     )
+
+        #     if model_path:
+        #         current_model = model_path
+        #         print(f"\n✅ Stage {i + 1}/{len(stages)} complete: n={stage['n']}")
+        #     else:
+        #         print(f"\n❌ Stage {i + 1}/{len(stages)} failed: n={stage['n']}")
+        #         print("Stopping curriculum training.")
+        #         break
+
+        ######################## MY STUFF #####################################################
+
+        setup_logging(stage_dir)
+        # Persistent values across runs for n
+        #num_runs = 2
+        success_count = 0
+        done_count = 0
+        run_moves = [0] * num_runs 
+        run_steps = [0] * num_runs
+        run_global_timesteps = [0] * num_runs
+        logging.info("n: %s", n)
+        logging.info("Model path: %s", model_path)
+
+        while done_count < num_runs:
+            logging.info("run: %s", done_count + 1)
+            obs, info = ogm_env.reset()
+            logging.info("Initital module positions: %s", ogm_env.env.ogm.module_positions)
+            logging.info("Final module positions: %s", ogm_env.env.ogm.final_module_positions)            
+            done = False
+            steps = 0
+            moves = 0
+
+            while not done:
+                action_mask = ogm_env.action_masks()
+                action, _ = model.predict(obs, action_masks=action_mask, deterministic=True)
+                obs, reward, terminated, truncated, info = ogm_env.step(action)
+                curr_sqdist = ogm_env.env.ogm.compute_pairwise_sqdist(
+                            ogm_env.env.ogm.module_positions
+                        )
+                phi = ogm_env.env.compute_unlabeled_soft_matching_score(curr_sqdist, ogm_env.env.final_sqdist)
+                logging.info("action: %s", action)
+                logging.info("step: %s", info["step"])#steps)
+                logging.info("current agent: %s", info["current_agent"])
+                logging.info("global time step: %s", info["episode_step"])
+                logging.info("reward: %s", reward)
+                logging.info("phi: %s", phi)
+                steps = steps + 1
+                done = terminated or truncated
+
+                if action != 48:
+                    moves = moves + 1
+
+            run_moves[done_count] = moves
+            run_steps[done_count] = info["step"]
+            run_global_timesteps[done_count] = info["episode_step"]
+            done_count = done_count + 1
+
+            if info["is_success"]:
+                success_count = success_count + 1
+
+            run_moves[done_count - 1]
+            logging.info("Success rate: %s%%", (success_count / done_count) * 100)
+        # calc median values
+
+        logging.info("Final success rate: %s%%", (success_count / done_count) * 100)
+        median_moves = statistics.median(run_moves)
+        median_steps = statistics.median(run_steps)
+        median_global_timesteps = statistics.median(run_global_timesteps)
+        logging.info("Moves per run: %s", run_moves)
+        logging.info("Steps per run: %s", run_steps)
+        logging.info("Global timesteps per run: %s", run_global_timesteps)
+        logging.info("Median moves: %s", median_moves)
+        logging.info("Median steps: %s", median_steps)
+        logging.info("Median global timesteps: %s", median_global_timesteps)
+
+
+if __name__ == "__main__":
+    num_runs = 100
+    run_tests(num_runs)
