@@ -416,6 +416,7 @@ def run_tests(num_runs):
         run_moves = [0] * num_runs 
         run_steps = [0] * num_runs
         run_global_timesteps = [0] * num_runs
+        run_phi = [0] * num_runs
         logging.info("n: %s", n)
         logging.info("Model path: %s", model_path)
 
@@ -451,6 +452,7 @@ def run_tests(num_runs):
             run_moves[done_count] = moves
             run_steps[done_count] = info["step"]
             run_global_timesteps[done_count] = info["episode_step"]
+            run_phi[done_count] = phi
             done_count = done_count + 1
 
             if info["is_success"]:
@@ -464,12 +466,15 @@ def run_tests(num_runs):
         median_moves = statistics.median(run_moves)
         median_steps = statistics.median(run_steps)
         median_global_timesteps = statistics.median(run_global_timesteps)
+        median_phi = statistics.median(run_phi)
         logging.info("Moves per run: %s", run_moves)
         logging.info("Steps per run: %s", run_steps)
         logging.info("Global timesteps per run: %s", run_global_timesteps)
         logging.info("Median moves: %s", median_moves)
         logging.info("Median steps: %s", median_steps)
         logging.info("Median global timesteps: %s", median_global_timesteps)
+        logging.info("Median shape similarity score phi: %s", median_phi)
+        
 
 
 if __name__ == "__main__":
